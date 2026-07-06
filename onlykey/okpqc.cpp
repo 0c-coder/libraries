@@ -1,28 +1,33 @@
 /*
  * okpqc.cpp — OnlyKey composite PQC PGP key operations (ML-KEM-768 + ML-DSA-65).
- * See okpqc.h for the slot layout. Mirrors the two-phase CRYPTO_AUTH flow of the
- * existing okcrypto_mlkem_decaps. UNTESTED — by inspection; validate on hardware.
+ * See okpqc.h for the 160-byte slot layout. Mirrors the two-phase CRYPTO_AUTH flow of
+ * okcrypto_mlkem_decaps. Target: NXP MK20DX256 (Cortex-M4, 64 KB RAM).
  *
- * Build notes:
- *   - mlkem-native: reuse the tree already vendored on feature/mlkem-768 (ML-KEM-768).
- *   - mldsa-native: add it with MLD_CONFIG_PARAMETER_SET=65 and MLD_CONFIG_REDUCE_RAM
- *     (ML-DSA-65 sign workspace ~17 KB with REDUCE_RAM vs ~69 KB without — the latter
- *     exceeds the MK20DX256's 64 KB RAM). Gate behind STD_VERSION like RSA.
+ * Libraries (vendored at repo root, compiled via their monolithic .c):
+ *   ML-KEM-768: mlkem_native   (crypto_kem_keypair_derand / crypto_kem_dec)
+ *   ML-DSA-65 : mldsa_native   built with MLD_CONFIG_PARAMETER_SET=65 + MLD_CONFIG_REDUCE_RAM
+ *               (~17 KB sign; 69 KB without -> exceeds 64 KB RAM)
+ *   Ed25519 / Curve25519: Arduino Crypto library (already used by the firmware).
+ *
+ * UNTESTED on hardware; the crypto core (keygen-from-seed + op) is verified on host.
  */
 #include "okpqc.h"
 #include <string.h>
+#include <Ed25519.h>
+#include "Curve25519.h"
+#include <RNG.h>
 
-#include "mlkem_native/mlkem_native.h"   /* ML-KEM-768 */
-#include "mldsa_native/mldsa_native.h"   /* ML-DSA-65 (MLD_CONFIG_PARAMETER_SET=65) */
-
-/* ---- mlkem-native ML-KEM-768 (same calls feature/mlkem-768 uses) ---- */
-extern "C" int crypto_kem_keypair_derand(uint8_t *pk, uint8_t *sk, const uint8_t *coins);
-extern "C" int crypto_kem_dec(uint8_t *ss, const uint8_t *ct, const uint8_t *sk);
-
-/* ---- mldsa-native ML-DSA-65 (namespaced) ---- */
+/* ---- vendored PQC primitives (declared here to avoid pulling the big headers) ---- */
+extern "C" int PQCP_MLKEM_NATIVE_MLKEM768_keypair_derand(uint8_t *pk, uint8_t *dk, const uint8_t *coins /*64B seed*/);
+extern "C" int PQCP_MLKEM_NATIVE_MLKEM768_dec(uint8_t *ss, const uint8_t *ct, const uint8_t *dk);
 extern "C" int PQCP_MLDSA_NATIVE_MLDSA65_keypair_internal(uint8_t *pk, uint8_t *sk, const uint8_t seed[32]);
 extern "C" int PQCP_MLDSA_NATIVE_MLDSA65_signature(uint8_t *sig, size_t *siglen,
                    const uint8_t *m, size_t mlen, const uint8_t *ctx, size_t ctxlen, const uint8_t *sk);
+
+/* ---- firmware RNG bridges required by mlkem_native / mldsa_native configs ----
+ * RNG is the Arduino Crypto library global (RNG.h), as used elsewhere in the firmware. */
+extern "C" int onlykey_mlkem_randombytes(uint8_t *out, size_t outlen) { RNG.rand(out, (size_t)outlen); return 0; }
+extern "C" int onlykey_mldsa_randombytes(uint8_t *out, size_t outlen) { RNG.rand(out, (size_t)outlen); return 0; }
 
 /* ---- firmware globals/APIs (okcore.cpp / okcrypto.cpp) ---- */
 extern uint8_t  rsa_private_key[];       /* 160-byte blob after okcore_flashget_RSA */
@@ -42,11 +47,6 @@ extern "C" {
   void send_transport_response(uint8_t *data, int len, bool enc, bool storeread);
   void hidprint(const char *s);
   void fadeoff(int);
-  /* ECC halves — thin wrappers over the firmware's existing Ed25519/X25519 primitives
-   * (the same math okcrypto_ecdsa_eddsa / okcrypto_ecdh use), called on the 32-byte
-   * secret in the blob rather than an ECC-slot key. Implement in okcrypto.cpp. */
-  int okpqc_ed25519_sign (uint8_t sig[64], const uint8_t *m, unsigned long mlen, const uint8_t sk[32]);
-  int okpqc_x25519_shared(uint8_t out[32], const uint8_t scalar[32], const uint8_t point[32]);
 }
 
 #ifndef OKDECRYPT_ERR_USER_ACTION_PENDING
@@ -62,12 +62,32 @@ extern "C" {
 #define LARGE_BUFFER_SIZE 1024
 #endif
 
-/* One scratch for the expanded secret key: ML-DSA sk(4032) covers ML-KEM dk(2400); never
- * used simultaneously. In .bss (not on the deep call stack); the library keeps its own
- * ~14-17 KB workspace internally. */
+/* Ed25519 sign over the 32-byte secret in the blob (derive pub, then sign). */
+static int okpqc_ed25519_sign(uint8_t sig[64], const uint8_t *m, size_t mlen, const uint8_t sk[32])
+{
+    uint8_t priv[32], pub[32];
+    memcpy(priv, sk, 32);
+    Ed25519::derivePublicKey(pub, priv);
+    Ed25519::sign(sig, priv, pub, m, mlen);
+    memset(priv, 0, sizeof priv);
+    return 0;
+}
+
+/* X25519 shared secret = scalar * point (Curve25519::eval clamps + mults). */
+static int okpqc_x25519_shared(uint8_t out[32], const uint8_t scalar[32], const uint8_t point[32])
+{
+    uint8_t s[32], p[32];
+    memcpy(s, scalar, 32); memcpy(p, point, 32);
+    bool ok = Curve25519::eval(out, s, p);
+    memset(s, 0, sizeof s);
+    return ok ? 0 : -1;
+}
+
+/* One scratch for the expanded secret key: ML-DSA sk(4032) covers ML-KEM dk(2400);
+ * never used simultaneously. In .bss so it isn't on the deep call stack. */
 static uint8_t pqc_expanded_sk[MLDSA_SK_SIZE];
 
-/* component selector, captured on the user-action phase and reused on the completion phase */
+/* component selector, captured on the user-action phase, reused on the completion phase */
 static uint8_t pqc_component;
 
 /* ============================== SIGN ============================== */
@@ -81,7 +101,6 @@ void okpqc_sign(uint8_t *buffer)
     }
     if (CRYPTO_AUTH != 4) return;
 
-    /* large_buffer holds the message digest to sign (transit-encrypted) */
     okcore_aes_gcm_decrypt(large_buffer, (uint8_t)packet_buffer_details[0],
                            (uint8_t)packet_buffer_details[1], profilekey, large_buffer_offset);
     pending_operation = CTAP2_ERR_OPERATION_PENDING;
@@ -89,10 +108,8 @@ void okpqc_sign(uint8_t *buffer)
 
     if (pqc_component == PQC_HALF_ECC) {                 /* Ed25519 */
         uint8_t sig[ED25519_SIG_SIZE];
-        int rc = okpqc_ed25519_sign(sig, large_buffer, (unsigned long)large_buffer_offset,
-                                    rsa_private_key + PQC_OFF_ED25519);
+        okpqc_ed25519_sign(sig, large_buffer, (size_t)large_buffer_offset, rsa_private_key + PQC_OFF_ED25519);
         memset(large_buffer, 0, LARGE_BUFFER_SIZE);
-        if (rc != 0) { pending_operation = 0; hidprint("Error Ed25519 sign"); return; }
         pending_operation = CTAP2_ERR_DATA_READY;
         send_transport_response(sig, ED25519_SIG_SIZE, false, true);
         memset(sig, 0, sizeof sig);
@@ -102,10 +119,9 @@ void okpqc_sign(uint8_t *buffer)
         size_t siglen = 0;
         int rc = PQCP_MLDSA_NATIVE_MLDSA65_keypair_internal(pk, pqc_expanded_sk,
                                                             rsa_private_key + PQC_OFF_MLDSA_SEED);
-        /* NOTE (verify on hardware): openpgp.js ml_dsa.js signs [0x00,0x00]||digest with empty
-         * ML-DSA context. Sending the RAW digest here and signing with ctx="" yields the same
-         * FIPS 204 message representative (0x00||0x00||digest). If openpgp.js instead pre-frames,
-         * switch to signature_internal over the raw bytes. */
+        /* openpgp.js ml_dsa.js signs [0x00,0x00]||digest with empty ML-DSA context; sending the
+         * RAW digest and signing with ctx="" yields the same FIPS 204 message representative.
+         * Verify against openpgp.js on hardware. */
         if (rc == 0) rc = PQCP_MLDSA_NATIVE_MLDSA65_signature(sig, &siglen, large_buffer,
                                     (size_t)large_buffer_offset, (const uint8_t*)0, 0, pqc_expanded_sk);
         memset(pqc_expanded_sk, 0, sizeof pqc_expanded_sk);
@@ -149,8 +165,8 @@ void okpqc_decrypt(uint8_t *buffer)
             memset(large_buffer, 0, LARGE_BUFFER_SIZE); return; }
         uint8_t pk[MLKEM_PK_SIZE], ss[MLKEM_SS_SIZE];
         /* seed used DIRECTLY as coins (d||z) — no SHAKE(32->64); this is an imported key */
-        int rc = crypto_kem_keypair_derand(pk, pqc_expanded_sk, rsa_private_key + PQC_OFF_MLKEM_SEED);
-        if (rc == 0) rc = crypto_kem_dec(ss, large_buffer, pqc_expanded_sk);
+        int rc = PQCP_MLKEM_NATIVE_MLKEM768_keypair_derand(pk, pqc_expanded_sk, rsa_private_key + PQC_OFF_MLKEM_SEED);
+        if (rc == 0) rc = PQCP_MLKEM_NATIVE_MLKEM768_dec(ss, large_buffer, pqc_expanded_sk);
         memset(pqc_expanded_sk, 0, MLKEM_DK_SIZE);
         memset(large_buffer, 0, LARGE_BUFFER_SIZE);
         if (rc != 0) { memset(ss, 0, sizeof ss); pending_operation = 0; hidprint("Error ML-KEM decaps"); return; }

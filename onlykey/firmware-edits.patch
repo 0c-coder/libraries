@@ -1,0 +1,65 @@
+diff --git a/onlykey/okcore.cpp b/onlykey/okcore.cpp
+index 827fd61..5baf267 100644
+--- a/onlykey/okcore.cpp
++++ b/onlykey/okcore.cpp
+@@ -5061,6 +5061,12 @@ int okcore_flashget_RSA(uint8_t slot)
+ 	{
+ 		type = (type & 0x0F);
+ 	}
++	if (type == KEYTYPE_PQC_PGP) { // composite PQC PGP key: 160-byte seed blob
++		adr = adr + ((slot * MAX_RSA_KEY_SIZE) - MAX_RSA_KEY_SIZE);
++		okcore_flashget_common((uint8_t *)rsa_private_key, (unsigned long *)adr, PQC_PGP_BLOB_LEN);
++		okcore_aes_gcm_decrypt(rsa_private_key, slot, features, profilekey, PQC_PGP_BLOB_LEN);
++		return features;
++	}
+ #ifdef DEBUG
+ 	Serial.print("Type of RSA KEY is ");
+ 	Serial.println(type, HEX);
+@@ -5159,6 +5165,15 @@ void rsa_priv_flash(uint8_t *buffer, bool wipe)
+ 			packet_buffer_offset = packet_buffer_offset + 57;
+ 		}
+ 	}
++	else if ((buffer[6] & 0x0F) == KEYTYPE_PQC_PGP)
++	{ // composite PQC PGP key: 160-byte seed blob
++		keysize = PQC_PGP_BLOB_LEN;
++		if (buffer[0] != 0xBA && packet_buffer_offset < PQC_PGP_BLOB_LEN)
++		{
++			memcpy(rsa_private_key + packet_buffer_offset, buffer + 7, 57);
++			packet_buffer_offset = packet_buffer_offset + 57;
++		}
++	}
+ 	else
+ 	{
+ 		hidprint("Error invalid RSA type");
+diff --git a/onlykey/okcore.h b/onlykey/okcore.h
+index 11ed80f..7b07402 100644
+--- a/onlykey/okcore.h
++++ b/onlykey/okcore.h
+@@ -86,6 +86,7 @@ extern "C"
+ 
+ #include <SoftTimer.h>
+ #include "base64.h"
++#include "okpqc.h"
+ 
+ /*************************************/
+ //Firmware Memory Locations
+diff --git a/onlykey/okcrypto.cpp b/onlykey/okcrypto.cpp
+index bb7577d..ec4397a 100644
+--- a/onlykey/okcrypto.cpp
++++ b/onlykey/okcrypto.cpp
+@@ -152,6 +152,7 @@ void okcrypto_sign (uint8_t *buffer) {
+ 		#ifdef DEBUG
+ 		Serial.print(features, BIN);
+ 		#endif
++		if ((type & 0x0F) == KEYTYPE_PQC_PGP) { okpqc_sign(buffer); return; }
+ 		if (is_bit_set(features, 6)) {
+ 			okcrypto_rsasign(buffer);
+ 		} else {
+@@ -219,6 +220,7 @@ void okcrypto_decrypt (uint8_t *buffer){
+ 			fadeoff(0);
+ 			return;
+ 		}
++		if ((type & 0x0F) == KEYTYPE_PQC_PGP) { okpqc_decrypt(buffer); return; }
+ 		if (is_bit_set(features, 5)) {
+ 			okcrypto_rsadecrypt(buffer);
+ 		} else {
