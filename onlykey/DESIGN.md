@@ -94,21 +94,36 @@ component outputs. No secret leaves the device.
 
 ---
 
-## 6. On-device primitives
+## 6. Implementation, primitives & memory (target: NXP MK20DX256)
 
-| primitive | source |
-|---|---|
-| Ed25519 sign, X25519 | **existing** (nacl/tweetnacl already in firmware) |
-| ML-KEM-768 keygen-from-seed + dec | **reuse `mlkem_native`** from `feature/mlkem-768` (copy the tree) |
-| ML-DSA-65 keygen-from-seed + sign | **new**: vendor `mldsa-native` (same pq-code-package family as mlkem_native) or pq-crystals dilithium (DILITHIUM_MODE=3) |
-| SHA3/SHAKE | comes with mlkem_native / mldsa-native |
+Target MCU: **NXP MK20DX256** (Teensy 3.2 class) — Cortex-M4 @ 72 MHz, **256 KB flash, 64 KB
+RAM**, 2 KB EEPROM, pure portable C (no NEON/asm backend). The whole implementation is the
+single consolidated pair **`okpqc.h` / `okpqc.cpp`** (supersedes the earlier
+`okcrypto_pqc_pgp.*` + `mlkem768.h`/`mldsa65.h`/`pqc_shim.c` split).
 
-API the glue calls:
+| primitive | library | on-device workspace |
+|---|---|---|
+| Ed25519 sign, X25519 | **existing firmware** (thin `okpqc_ed25519_sign` / `okpqc_x25519_shared` wrappers) | negligible |
+| ML-KEM-768 keygen-from-seed + decaps | **`mlkem-native`** (reuse the tree from `feature/mlkem-768`) | decaps **~14 KB** |
+| ML-DSA-65 keygen-from-seed + sign | **`mldsa-native`** (PQCA, portable C90, formally verified) | sign **~17 KB with `MLD_CONFIG_REDUCE_RAM`** |
+| SHA3/SHAKE | bundled with mlkem-native / mldsa-native | — |
+
+**`MLD_CONFIG_REDUCE_RAM` is mandatory:** ML-DSA-65 signing is **69,312 B without it — larger
+than the 64 KB RAM** — and **17,248 B with it.** Both crypto ops run when the 18 KB backup buffer
+is not allocated, so ~40+ KB is free; comfortable. (Why not Mbed-TLS: it has no shipping PQC yet —
+ML-DSA is roadmapped for 2026 Q2, ML-KEM later. Why not wolfCrypt: a whole second TLS stack for two
+primitives; mlkem-native/mldsa-native are the minimal, verified, RAM-tunable fit and you already
+use mlkem-native.)
+
+Exact symbols `okpqc.cpp` calls:
 ```c
-int mlkem768_keypair_from_seed(uint8_t pk[1184], uint8_t dk[2400], const uint8_t seed[64]); // coins = seed
-int mlkem768_dec(uint8_t ss[32], const uint8_t ct[1088], const uint8_t dk[2400]);
-int mldsa65_keypair_from_seed(uint8_t pk[1952], uint8_t sk[4032], const uint8_t seed[32]);
-int mldsa65_sign(uint8_t *sig, size_t *siglen, const uint8_t *m, size_t mlen, const uint8_t sk[4032]);
+// mlkem-native (same calls feature/mlkem-768 uses):
+int crypto_kem_keypair_derand(uint8_t *pk, uint8_t *dk, const uint8_t *coins /*64B seed*/);
+int crypto_kem_dec(uint8_t *ss, const uint8_t *ct, const uint8_t *dk);
+// mldsa-native (MLD_CONFIG_PARAMETER_SET=65):
+int PQCP_MLDSA_NATIVE_MLDSA65_keypair_internal(uint8_t *pk, uint8_t *sk, const uint8_t seed[32]);
+int PQCP_MLDSA_NATIVE_MLDSA65_signature(uint8_t *sig, size_t *siglen,
+        const uint8_t *m, size_t mlen, const uint8_t *ctx, size_t ctxlen, const uint8_t *sk);
 ```
 
 ## 7. Response sizing
