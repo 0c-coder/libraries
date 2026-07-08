@@ -87,14 +87,11 @@ static int okpqc_x25519_shared(uint8_t out[32], const uint8_t scalar[32], const 
  * never used simultaneously. In .bss so it isn't on the deep call stack. */
 static uint8_t pqc_expanded_sk[MLDSA_SK_SIZE];
 
-/* component selector, captured on the user-action phase, reused on the completion phase */
-static uint8_t pqc_component;
 
 /* ============================== SIGN ============================== */
 void okpqc_sign(uint8_t *buffer)
 {
     if (!CRYPTO_AUTH) {
-        pqc_component = buffer[6];
         process_packets(buffer, 0, 0);
         pending_operation = OKDECRYPT_ERR_USER_ACTION_PENDING;
         return;
@@ -106,9 +103,14 @@ void okpqc_sign(uint8_t *buffer)
     pending_operation = CTAP2_ERR_OPERATION_PENDING;
     outputmode = (int)packet_buffer_details[2];
 
-    if (pqc_component == PQC_HALF_ECC) {                 /* Ed25519 */
+    /* wire: large_buffer[0] = component selector, large_buffer[1..] = message digest */
+    uint8_t  sel = large_buffer[0];
+    uint8_t *msg = large_buffer + 1;
+    size_t   msglen = (large_buffer_offset > 0) ? (size_t)(large_buffer_offset - 1) : 0;
+
+    if (sel == PQC_HALF_ECC) {                           /* Ed25519 */
         uint8_t sig[ED25519_SIG_SIZE];
-        okpqc_ed25519_sign(sig, large_buffer, (size_t)large_buffer_offset, rsa_private_key + PQC_OFF_ED25519);
+        okpqc_ed25519_sign(sig, msg, msglen, rsa_private_key + PQC_OFF_ED25519);
         memset(large_buffer, 0, LARGE_BUFFER_SIZE);
         pending_operation = CTAP2_ERR_DATA_READY;
         send_transport_response(sig, ED25519_SIG_SIZE, false, true);
@@ -122,8 +124,8 @@ void okpqc_sign(uint8_t *buffer)
         /* openpgp.js ml_dsa.js signs [0x00,0x00]||digest with empty ML-DSA context; sending the
          * RAW digest and signing with ctx="" yields the same FIPS 204 message representative.
          * Verify against openpgp.js on hardware. */
-        if (rc == 0) rc = PQCP_MLDSA_NATIVE_MLDSA65_signature(sig, &siglen, large_buffer,
-                                    (size_t)large_buffer_offset, (const uint8_t*)0, 0, pqc_expanded_sk);
+        if (rc == 0) rc = PQCP_MLDSA_NATIVE_MLDSA65_signature(sig, &siglen, msg, msglen,
+                                    (const uint8_t*)0, 0, pqc_expanded_sk);
         memset(pqc_expanded_sk, 0, sizeof pqc_expanded_sk);
         memset(large_buffer, 0, LARGE_BUFFER_SIZE);
         if (rc != 0 || siglen != MLDSA_SIG_SIZE) { pending_operation = 0; hidprint("Error ML-DSA sign"); return; }
@@ -138,7 +140,6 @@ void okpqc_sign(uint8_t *buffer)
 void okpqc_decrypt(uint8_t *buffer)
 {
     if (!CRYPTO_AUTH) {
-        pqc_component = buffer[6];
         process_packets(buffer, 0, 0);
         pending_operation = OKDECRYPT_ERR_USER_ACTION_PENDING;
         return;
@@ -150,9 +151,8 @@ void okpqc_decrypt(uint8_t *buffer)
     pending_operation = CTAP2_ERR_OPERATION_PENDING;
     outputmode = (int)packet_buffer_details[2];
 
-    if (pqc_component == PQC_HALF_ECC) {                 /* X25519 on the 32-byte ephemeral point */
-        if (large_buffer_offset != X25519_SS_SIZE) { hidprint("Error X25519 point size");
-            memset(large_buffer, 0, LARGE_BUFFER_SIZE); return; }
+    /* component inferred from input size: 32 B ephemeral point -> X25519, 1088 B ct -> ML-KEM */
+    if (large_buffer_offset == X25519_SS_SIZE) {         /* X25519 on the 32-byte ephemeral point */
         uint8_t ss[X25519_SS_SIZE];
         int rc = okpqc_x25519_shared(ss, rsa_private_key + PQC_OFF_X25519, large_buffer);
         memset(large_buffer, 0, LARGE_BUFFER_SIZE);
@@ -160,9 +160,7 @@ void okpqc_decrypt(uint8_t *buffer)
         memcpy(large_resp_buffer, ss, X25519_SS_SIZE); memset(ss, 0, sizeof ss);
         pending_operation = CTAP2_ERR_DATA_READY;
         send_transport_response(large_resp_buffer, X25519_SS_SIZE, false, true);
-    } else {                                             /* ML-KEM-768 decapsulate 1088-B ct */
-        if (large_buffer_offset != MLKEM_CT_SIZE) { hidprint("Error ML-KEM ct size");
-            memset(large_buffer, 0, LARGE_BUFFER_SIZE); return; }
+    } else if (large_buffer_offset == MLKEM_CT_SIZE) {   /* ML-KEM-768 decapsulate 1088-B ct */
         uint8_t pk[MLKEM_PK_SIZE], ss[MLKEM_SS_SIZE];
         /* seed used DIRECTLY as coins (d||z) — no SHAKE(32->64); this is an imported key */
         int rc = PQCP_MLKEM_NATIVE_MLKEM768_keypair_derand(pk, pqc_expanded_sk, rsa_private_key + PQC_OFF_MLKEM_SEED);
@@ -173,6 +171,10 @@ void okpqc_decrypt(uint8_t *buffer)
         memcpy(large_resp_buffer, ss, MLKEM_SS_SIZE); memset(ss, 0, sizeof ss);
         pending_operation = CTAP2_ERR_DATA_READY;
         send_transport_response(large_resp_buffer, MLKEM_SS_SIZE, false, true);
+    } else {
+        hidprint("Error PQC decrypt: bad input size");
+        memset(large_buffer, 0, LARGE_BUFFER_SIZE);
+        pending_operation = 0;
     }
     fadeoff(85);
 }
