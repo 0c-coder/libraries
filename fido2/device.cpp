@@ -86,6 +86,7 @@ int webcryptcheck (uint8_t * _appid, uint8_t * buffer) {
     //const char stored_clientDataHash[] = "\x57\x81\xAF\x14\xB9\x71\x6D\x87\x24\x61\x8E\x8A\x6F\xD6\x50\xEB\x6B\x02\x6B\xEC\x6B\xAD\xB3\xB1\xA3\x01\xAA\x0D\x75\xF6\x0C\x14";
     //const char stored_clientDataHash_u2f[] = "\x78\x4E\x39\xF2\xDA\xF8\xE6\xA4\xBB\xD7\x15\x0D\x39\x34\xCC\x81\x5F\x6E\xE7\x6F\x57\xBC\x02\x6A\x0E\x49\x33\x13\xF4\x36\x63\x47"; 
     const char stored_apprpid[] = "\x61\x70\x70\x73\x2E\x63\x72\x70\x2E\x74\x6F\x02"; //apps.crp.to + 0x02 teminating character
+    const char stored_appid_oa[] = "\xB8\xAA\xE5\x9C\x19\xDE\x59\x2A\xDB\xF1\xCA\x0A\x15\xC0\x03\x15\x88\x98\x8B\x61\x44\xFA\xA7\xC2\xE1\xC4\x30\x34\xC1\x66\xD5\x83"; //SHA256("onlyagent.app") - OnlyAgent origin
 	uint8_t rpid[12];
     int appid_match1;
 	int appid_match2;
@@ -108,7 +109,8 @@ int webcryptcheck (uint8_t * _appid, uint8_t * buffer) {
     
     appid_match1 = memcmp (stored_apprpid, rpid, 12);
 	appid_match2 = memcmp (stored_appid, _appid, 32);
-    if ((appid_match1 == 0 || appid_match2 == 0) && !(is_bit_set(derived_key_challenge_mode, 1))) {
+	int appid_match3 = memcmp (stored_appid_oa, _appid, 32); //OnlyAgent origin (onlyagent.app)
+    if ((appid_match1 == 0 || appid_match2 == 0 || appid_match3 == 0) && !(is_bit_set(derived_key_challenge_mode, 1))) {
         return 2;
     } else if (buffer[0]==0xFF && buffer[1]==0xFF && buffer[2]==0xFF && buffer[3]==0xFF && buffer[4]==OKCONNECT && is_bit_set(derived_key_challenge_mode, 2)) {
         return 1;
