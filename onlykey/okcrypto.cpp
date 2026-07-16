@@ -332,12 +332,13 @@ void okcrypto_getpubkey (uint8_t *buffer) {
 	} else if (buffer[5] == RESERVED_KEY_DERIVATION && buffer[6] <= KEYTYPE_CURVE25519) { // Generate key using provided data, return public
 	okcrypto_derive_key(buffer[6], buffer+7, NULL);
 	send_transport_response(ecc_public_key, 64, false, false);
+#ifdef ONLYAGENT_I2C
 	} else if (buffer[5] == RESERVED_KEY_OA_FDE_KEK || buffer[5] == RESERVED_KEY_OA_FDE_TRANSIT) {
 		// OnlyAgent derived X-Wing, FULL on-device. The slot picks a firmware-constant
 		// label; nothing is taken from the host. Returns pk_M||pk_X (1216B); the seed
 		// is NOT disclosed (unlike the split-custody branch below).
 		// NOTE >64 bytes: needs the multi-frame response path on I2C (okic2 v1 holds
-		// one frame). Provision over USB. See INTEGRATION-i2c.md.
+		// one frame). Provision over USB against this same appliance build.
 		uint8_t label32[32];
 		if (okcrypto_xwing_slot_label(buffer[5], label32)) {
 			okcrypto_xwing_derive_seed(label32);
@@ -345,6 +346,7 @@ void okcrypto_getpubkey (uint8_t *buffer) {
 			memset(ecc_private_key, 0, MAX_ECC_KEY_SIZE);
 			memset(label32, 0, sizeof(label32));
 		}
+#endif
 	} else if (buffer[5] == RESERVED_KEY_WEB_DERIVATION && (buffer[6] & 0x0F) == KEYTYPE_XWING) {
 		// Derived X-Wing recipient over HID: buffer[7..39] = 32-byte label tag.
 		// Returns [ pk_X(32) | mlkem_seed(32) ]. See okcrypto_xwing_web_derive.
@@ -362,6 +364,10 @@ void okcrypto_decrypt (uint8_t *buffer){
 	Serial.println();
 	Serial.println("OKDECRYPT MESSAGE RECEIVED");
 	#endif
+#ifdef ONLYAGENT_I2C
+	// Appliance-only. Guarded because the transit slot's retain path (which stops
+	// ss reaching the wire) is also ONLYAGENT_I2C-gated — without the guard a stock
+	// build would fall through and send the transit shared secret over USB.
 	if (buffer[5] == RESERVED_KEY_OA_FDE_KEK || buffer[5] == RESERVED_KEY_OA_FDE_TRANSIT) {
 		// OnlyAgent derived X-Wing decaps, FULL on-device (seed never leaves).
 		// The slot picks a firmware-constant label; large_buffer holds ONLY the
@@ -2149,6 +2155,7 @@ void okcrypto_xwing_decaps (uint8_t *buffer) {
 
 		pending_operation=CTAP2_ERR_DATA_READY;
 		outputmode=packet_buffer_details[2];
+#ifdef ONLYAGENT_I2C
 		if (packet_buffer_details[1] == RESERVED_KEY_OA_FDE_TRANSIT) {
 			// Transit setup: RETAIN ss as the single-use transit key instead of
 			// putting it on the wire. Unconditional — the transit slot must never
@@ -2158,7 +2165,9 @@ void okcrypto_xwing_decaps (uint8_t *buffer) {
 			okic2_session_set(ss);
 			uint8_t ack[2] = {0x01, 0x00};
 			send_transport_response(ack, 2, false, false);
-		} else {
+		} else
+#endif
+		{
 			send_transport_response(ss, XWING_SS_SIZE, true, true);
 		}
 		if (outputmode != WEBAUTHN) {

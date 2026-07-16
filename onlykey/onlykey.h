@@ -82,6 +82,12 @@
 #define STD_VERSION //Define for STD edition firmare, undefine for IN TRVL edition firmware
 #define OK_Color //Define for hardware with color LED
 #define FACTORYKEYS // Attestation key and other keys encrypted using CHIP ID and RNG for unique keys per device
+//#define ONLYAGENT_I2C // Define for the OnlyAgent appliance ONLY: adds the I2C slave
+                        // transport (okic2.h) so the on-board LicheeRV/NanoKVM can drive
+                        // the device for FDE unlock while USB HID stays available to the
+                        // host. Default OFF: it claims the I2C pins and pulls in Wire, and
+                        // stock OnlyKey hardware has no use for it. Gates okic2_begin() /
+                        // okic2_poll() in the OnlyKey.ino sketch.
 #define OKversionmaj "3"
 #define OKversionmin "0"
 #define OKversionpat "4"

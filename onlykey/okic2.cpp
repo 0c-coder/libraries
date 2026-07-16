@@ -4,6 +4,13 @@
  *
  * UNTESTED against hardware - by inspection.
  */
+// onlykey.h first: it carries the ONLYAGENT_I2C build flag (and pulls okcore.h ->
+// okic2.h). Everything below is compiled out for stock OnlyKey builds, so they do
+// not link Wire or carry this file's static buffers — MK20 flash/RAM is tight.
+#include "onlykey.h"
+
+#ifdef ONLYAGENT_I2C
+
 #include "okic2.h"
 #include "okcore.h"
 #include "okcrypto.h"
@@ -187,3 +194,5 @@ void okic2_poll(void)
     recvmsg(1);                               // may block on button press
     okic2_active = false;
 }
+
+#endif // ONLYAGENT_I2C
