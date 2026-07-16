@@ -251,12 +251,16 @@ void okcrypto_xwing_web_derive (uint8_t *label32, uint8_t *ct_x, uint8_t *out64)
 	memset(ecc_public_key, 0, sizeof(ecc_public_key));
 	// sk_X -> ecc_private_key, pk_X -> ecc_public_key
 	okcrypto_derive_key(KEYTYPE_CURVE25519, additional_data, RESERVED_KEY_WEB_DERIVATION);
-	// mlkem_seed = SHA256( sk_X || tag ) : one-way, domain-separated (!= sk_X)
-	const char xwtag[] = "onlykey/xwing/mlkem768-seed/v1";
-	SHA256_CTX xc; sha256_init(&xc);
-	sha256_update(&xc, ecc_private_key, 32);
-	sha256_update(&xc, (const uint8_t*)xwtag, sizeof(xwtag) - 1);
-	sha256_final(&xc, out64 + 32);   // mlkem_seed in bytes 32..64 (before ss_X to keep sk_X)
+	// mlkem_seed = HKDF-SHA256(salt=[3|label32], IKM=sk_X, info=SHA256(RPID), L=32)
+	// RFC5869 via okcrypto_hkdf — was SHA256(sk_X || tag), a raw-hash construction.
+	// One-way, so a host holding mlkem_seed still learns nothing about sk_X.
+	// Salt flag 3 domain-separates: 0/1 = web/age sk_X (non-press/press),
+	// 2 = OnlyAgent FDE X-Wing seed, 3 = this ML-KEM seed. Keep them disjoint.
+	uint8_t seed_salt[33];
+	seed_salt[0] = 3;
+	memcpy(seed_salt + 1, label32, 32);
+	okcrypto_hkdf(seed_salt, ecc_private_key, out64 + 32, 32);
+	memset(seed_salt, 0, sizeof(seed_salt));   // mlkem_seed in bytes 32..64 (keeps sk_X)
 	if (ct_x) {
 		// ss_X = X25519(sk_X, ct_X); scalar is ecc_private_key set above
 		okcrypto_shared_secret(ct_x, out64);   // ss_X in bytes 0..32

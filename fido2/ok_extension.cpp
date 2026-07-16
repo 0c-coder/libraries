@@ -221,13 +221,20 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
 				if (opt2 == KEYTYPE_XWING) {
 					// sk_X + pk_X from the web-derivation key (same as CURVE25519 path)
 					okcrypto_derive_key(KEYTYPE_CURVE25519, additional_data, RESERVED_KEY_WEB_DERIVATION);
-					// mlkem_seed = SHA256( sk_X || tag ) : one-way, domain-separated (!= sk_X)
+					// mlkem_seed = HKDF-SHA256(salt=[3|label32], IKM=sk_X,
+					//                          info=SHA256(RPID), L=32)   [RFC5869]
+					// Was SHA256(sk_X || tag) — a raw-hash construction. Still one-way,
+					// so a browser holding mlkem_seed learns nothing about sk_X.
+					// MUST stay byte-identical to okcrypto_xwing_web_derive() in
+					// okcrypto.cpp, or CLI-derived and web-derived identities diverge.
+					// Salt flag 3 domain-separates: 0/1 = sk_X (non-press/press),
+					// 2 = OnlyAgent FDE X-Wing seed, 3 = this ML-KEM seed.
 					uint8_t xwing_seed[32];
-					const char xwtag[] = "onlykey/xwing/mlkem768-seed/v1";
-					SHA256_CTX xc; sha256_init(&xc);
-					sha256_update(&xc, ecc_private_key, 32);
-					sha256_update(&xc, (const uint8_t*)xwtag, sizeof(xwtag) - 1);
-					sha256_final(&xc, xwing_seed);
+					uint8_t seed_salt[33];
+					seed_salt[0] = 3;
+					memcpy(seed_salt + 1, additional_data + 1, 32);   // label32
+					okcrypto_hkdf(seed_salt, ecc_private_key, xwing_seed, 32);
+					memset(seed_salt, 0, sizeof(seed_salt));
 					uint8_t *xout = temp + 32 + sizeof(UNLOCKED) + 1;
 					if (opt1 == DERIVE_SHAREDSEC || opt1 == DERIVE_SHAREDSEC_REQ_PRESS) {
 						if (opt1 == DERIVE_SHAREDSEC_REQ_PRESS) {
