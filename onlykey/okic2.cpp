@@ -21,7 +21,6 @@ extern void recvmsg(int n);
 extern bool unlocked;
 
 volatile bool okic2_active = false;
-volatile bool okic2_session_target = false;
 
 // -- Single-use transit key ------------------------------------------------
 static uint8_t transit_key_i2c[32];
@@ -177,15 +176,14 @@ void okic2_poll(void)
         return;
     }
 
-    // Tell the X-Wing decaps dispatch to retain ss as the transit key rather
-    // than returning it on the wire. Cleared by that branch (INTEGRATION-i2c.md).
-    okic2_session_target = (report[4] == OKIC2_CMD_SESSION);
-
+    // No session opcode: report[4] is the OnlyKey message byte (e.g. OKDECRYPT) and
+    // recvmsg() switches on it, so it cannot be repurposed. The transit-key setup is
+    // identified by the SLOT instead (report[5] == RESERVED_KEY_OA_FDE_TRANSIT),
+    // which okcrypto_xwing_decaps() checks directly. See INTEGRATION-i2c.md.
     okic2_active = true;
     memcpy(recv_buffer, report, OKIC2_REPORT_LEN);
     memset(report, 0, sizeof(report));
     outputmode = RAW_I2C;                     // route send_transport_response()
     recvmsg(1);                               // may block on button press
     okic2_active = false;
-    okic2_session_target = false;
 }

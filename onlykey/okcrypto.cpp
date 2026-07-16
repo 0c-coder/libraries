@@ -270,6 +270,52 @@ void okcrypto_xwing_web_derive (uint8_t *label32, uint8_t *ct_x, uint8_t *out64)
 	memset(additional_data, 0, sizeof(additional_data));
 }
 
+// Derived X-Wing seed — no ECC slot consumed, and unlike okcrypto_xwing_web_derive()
+// the seed never leaves the device: it feeds the FULL on-device X-Wing.
+//
+// The seed IS the HKDF output; do NOT hash it again. okcrypto_derive_key() with slot
+// RESERVED_KEY_WEB_DERIVATION runs RFC5869 okcrypto_hkdf():
+//   PRK  = HMAC-SHA256(salt=[2|label32], IKM=web-derivation key)
+//   seed = HMAC-SHA256(PRK, SHA256(RPID) || 0x01)   -> ecc_private_key, 32 bytes
+//
+// KEYTYPE_XWING is load-bearing: okcrypto_compute_pubkey() early-returns for PQ key
+// types, leaving the HKDF output pristine. The CURVE25519 path would run
+// swap_buffer(0,31,ecc_private_key) and byte-REVERSE the seed. It also leaves
+// type = KEYTYPE_XWING, which is what the dispatch expects.
+//
+// Salt flag 2 domain-separates this from 0/1 (web/age sk_X) and 3 (age mlkem_seed);
+// with flag 0 this seed would equal the age plugin's sk_X for the same label.
+void okcrypto_xwing_derive_seed (uint8_t *label32) {
+	extern uint8_t ctap_buffer[CTAPHID_BUFFER_SIZE];
+	// Stage RPID where okcrypto_hkdf reads it: ctap_buffer+4 .. 0x02 terminator.
+	// Must happen before xwing_getpubkey/xwing_decaps reuse ctap_buffer for sk_M/pk_M.
+	const char rpid[] = "onlyagent.app";
+	memcpy(ctap_buffer + 4, rpid, sizeof(rpid) - 1);
+	ctap_buffer[4 + sizeof(rpid) - 1] = 0x02;
+	uint8_t additional_data[33];
+	additional_data[0] = 2;
+	memcpy(additional_data + 1, label32, 32);
+	okcrypto_derive_key(KEYTYPE_XWING, additional_data, RESERVED_KEY_WEB_DERIVATION);
+	memset(additional_data, 0, sizeof(additional_data));
+}
+
+// Label for an OnlyAgent derived-X-Wing slot. The strings are firmware constants:
+// the host names a PURPOSE (via the slot) and never supplies label bytes, so it
+// cannot steer derivation. Must match okfde-client's LABEL_KEK / LABEL_TRANSIT,
+// which are SHA256(utf8(same string)).
+// Returns 0 if the slot is not an OnlyAgent derived-X-Wing slot.
+static uint8_t okcrypto_xwing_slot_label (uint8_t slot, uint8_t out32[32]) {
+	const char *s;
+	if (slot == RESERVED_KEY_OA_FDE_KEK)          s = "fde:onlyagent";
+	else if (slot == RESERVED_KEY_OA_FDE_TRANSIT) s = "fde-transit:onlyagent";
+	else return 0;
+	SHA256_CTX c;
+	sha256_init(&c);
+	sha256_update(&c, (const uint8_t *)s, strlen(s));
+	sha256_final(&c, out32);
+	return 1;
+}
+
 void okcrypto_getpubkey (uint8_t *buffer) {
 	#ifdef DEBUG
 	Serial.println();
@@ -286,6 +332,19 @@ void okcrypto_getpubkey (uint8_t *buffer) {
 	} else if (buffer[5] == RESERVED_KEY_DERIVATION && buffer[6] <= KEYTYPE_CURVE25519) { // Generate key using provided data, return public
 	okcrypto_derive_key(buffer[6], buffer+7, NULL);
 	send_transport_response(ecc_public_key, 64, false, false);
+	} else if (buffer[5] == RESERVED_KEY_OA_FDE_KEK || buffer[5] == RESERVED_KEY_OA_FDE_TRANSIT) {
+		// OnlyAgent derived X-Wing, FULL on-device. The slot picks a firmware-constant
+		// label; nothing is taken from the host. Returns pk_M||pk_X (1216B); the seed
+		// is NOT disclosed (unlike the split-custody branch below).
+		// NOTE >64 bytes: needs the multi-frame response path on I2C (okic2 v1 holds
+		// one frame). Provision over USB. See INTEGRATION-i2c.md.
+		uint8_t label32[32];
+		if (okcrypto_xwing_slot_label(buffer[5], label32)) {
+			okcrypto_xwing_derive_seed(label32);
+			okcrypto_xwing_getpubkey(buffer);
+			memset(ecc_private_key, 0, MAX_ECC_KEY_SIZE);
+			memset(label32, 0, sizeof(label32));
+		}
 	} else if (buffer[5] == RESERVED_KEY_WEB_DERIVATION && (buffer[6] & 0x0F) == KEYTYPE_XWING) {
 		// Derived X-Wing recipient over HID: buffer[7..39] = 32-byte label tag.
 		// Returns [ pk_X(32) | mlkem_seed(32) ]. See okcrypto_xwing_web_derive.
@@ -303,6 +362,20 @@ void okcrypto_decrypt (uint8_t *buffer){
 	Serial.println();
 	Serial.println("OKDECRYPT MESSAGE RECEIVED");
 	#endif
+	if (buffer[5] == RESERVED_KEY_OA_FDE_KEK || buffer[5] == RESERVED_KEY_OA_FDE_TRANSIT) {
+		// OnlyAgent derived X-Wing decaps, FULL on-device (seed never leaves).
+		// The slot picks a firmware-constant label; large_buffer holds ONLY the
+		// 1120-byte ct, so okcrypto_xwing_decaps() is reused verbatim.
+		// Re-derives on every call, including the CRYPTO_AUTH==4 phase after the
+		// button press, since buffer[5] is preserved across the two-phase flow.
+		uint8_t label32[32];
+		if (okcrypto_xwing_slot_label(buffer[5], label32)) {
+			okcrypto_xwing_derive_seed(label32);
+			memset(label32, 0, sizeof(label32));
+			okcrypto_xwing_decaps(buffer);
+		}
+		return;
+	}
 	if (buffer[5] == RESERVED_KEY_WEB_DERIVATION && (buffer[6] & 0x0F) == KEYTYPE_XWING) {
 		// Derived X-Wing decaps over HID (split custody). Input carries the
 		// 32-byte label tag then ct_X(32). NOTE: 32+32=64B exceeds one 57-byte
@@ -2005,6 +2078,17 @@ void okcrypto_xwing_decaps (uint8_t *buffer) {
 	#endif
 	if (!CRYPTO_AUTH) {
 		process_packets(buffer, 0, 0);
+		// Transit-key setup needs no touch: ss is retained as the transit key and
+		// nothing leaves the device. Same "no press required" idiom the HMAC
+		// challenge-mode path uses (okcore.cpp: CRYPTO_AUTH=4; op(); CRYPTO_AUTH=0).
+		// done_process_packets() sets CRYPTO_AUTH=1 only once the LAST packet of the
+		// 1120-byte ct has landed, so this fires exactly once, fully staged.
+		if (buffer[5] == RESERVED_KEY_OA_FDE_TRANSIT && CRYPTO_AUTH == 1) {
+			CRYPTO_AUTH = 4;
+			okcrypto_xwing_decaps(buffer);
+			CRYPTO_AUTH = 0;
+			return;
+		}
 		pending_operation=OKDECRYPT_ERR_USER_ACTION_PENDING;
 	}
 	else if (CRYPTO_AUTH == 4) {
@@ -2065,7 +2149,18 @@ void okcrypto_xwing_decaps (uint8_t *buffer) {
 
 		pending_operation=CTAP2_ERR_DATA_READY;
 		outputmode=packet_buffer_details[2];
-		send_transport_response(ss, XWING_SS_SIZE, true, true);
+		if (packet_buffer_details[1] == RESERVED_KEY_OA_FDE_TRANSIT) {
+			// Transit setup: RETAIN ss as the single-use transit key instead of
+			// putting it on the wire. Unconditional — the transit slot must never
+			// emit a shared secret on ANY transport. The ack carries no secret; the
+			// NEXT response is the one encrypted under this key, after which okic2
+			// zeroizes it. See okic2.h / INTEGRATION-i2c.md.
+			okic2_session_set(ss);
+			uint8_t ack[2] = {0x01, 0x00};
+			send_transport_response(ack, 2, false, false);
+		} else {
+			send_transport_response(ss, XWING_SS_SIZE, true, true);
+		}
 		if (outputmode != WEBAUTHN) {
 			wipetasks();
 		}

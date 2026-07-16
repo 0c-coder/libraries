@@ -20,11 +20,13 @@
  *
  * Establishment (PQ-safe, reuses the existing X-Wing primitives):
  *   1. Host encapsulates to the device's DERIVED X-Wing key for the transit
- *      label -> (ct 1120B, ss 32B). Encapsulation is randomised, so a fixed
+ *      slot -> (ct 1120B, ss 32B). Encapsulation is randomised, so a fixed
  *      device key still yields a fresh ss every time.
- *   2. Host sends ct with OKIC2_CMD_SESSION; the device derives the same key
- *      from (web-derivation key, label), decapsulates on-device and retains ss.
- *      No seed and no secret ever leaves the device, so this needs no touch.
+ *   2. Host sends the ct as a normal OKDECRYPT to slot RESERVED_KEY_OA_FDE_TRANSIT
+ *      (no special opcode: report[4] is the message byte recvmsg() switches on).
+ *      The device derives that slot's key from its firmware-constant label,
+ *      decapsulates on-device and RETAINS ss — that slot never emits a shared
+ *      secret. No seed and no secret leaves the device, so this needs no touch.
  *   3. Both sides: transit_key = SHA256(ss). Device acks in plaintext.
  * Breaking a recorded exchange requires breaking BOTH X25519 and ML-KEM-768.
  *
@@ -55,6 +57,7 @@
 #define OKIC2_H
 
 #include <stdint.h>
+#include <stdbool.h>
 
 #define OKIC2_ADDR        0x2C   // 7-bit I2C slave address
 #define OKIC2_REPORT_LEN  64
@@ -68,10 +71,12 @@
 #define OKIC2_ENC_FRAME_LEN 85   // 1 + 1 + 1 + 64 ct + 16 tag + 2 crc
 #define OKIC2_MAX_FRAME     OKIC2_ENC_FRAME_LEN
 
-// Session control (report[4]); the 1120-byte X-Wing ct arrives via the existing
-// multi-packet reassembly into large_buffer, as okcrypto_xwing_decaps expects.
-#define OKIC2_CMD_SESSION 0xE0   // set single-use transit key from staged ct
-#define OKIC2_CMD_SESSEND 0xE1   // zeroize the transit key
+// Transit-key setup has no opcode: report[4] is the OnlyKey message byte that
+// recvmsg() switches on, so it cannot be repurposed. Setup is just an OKDECRYPT to
+// slot RESERVED_KEY_OA_FDE_TRANSIT; the 1120-byte X-Wing ct arrives via the existing
+// multi-packet reassembly into large_buffer, as okcrypto_xwing_decaps expects, and
+// that function retains ss as the transit key instead of returning it.
+#define OKIC2_CMD_SESSEND 0xE1   // zeroize the transit key (okic2-local, no dispatch)
 
 // Status byte returned on a bare 1-byte master read.
 #define OKIC2_ST_LOCKED   0x01   // powered, PIN not yet entered
@@ -81,18 +86,27 @@
 #define OKIC2_ST_ERROR    0x06   // last command errored (CRC/parse)
 #define OKIC2_ST_NOSESS   0x07   // secret response due but no transit key set
 
+// okcore.h includes this from inside its own extern "C" block, so guard linkage
+// here the same way okpqc.h does — otherwise okic2.cpp (which includes this header
+// first, at C++ linkage) and okcore.cpp (C linkage) would disagree and fail to link.
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 extern void okic2_begin(void);          // call from setup()
 extern void okic2_poll(void);           // call from loop()
 extern void okic2_queue_response(uint8_t *data, int len);
 
 // Set the single-use transit key from ss (32B, from on-device X-Wing decaps).
+// Called by okcrypto_xwing_decaps() for slot RESERVED_KEY_OA_FDE_TRANSIT.
 extern int  okic2_session_set(const uint8_t *ss32);
 // Zeroize the transit key. Called automatically after one encrypted response.
 extern void okic2_session_end(void);
-// True once okic2_poll() sees OKIC2_CMD_SESSION, so the decaps dispatch retains
-// ss as the transit key instead of returning it. See INTEGRATION-i2c.md.
-extern volatile bool okic2_session_target;
 
 extern volatile bool okic2_active;
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif // OKIC2_H

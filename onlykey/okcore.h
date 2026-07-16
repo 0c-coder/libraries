@@ -87,6 +87,7 @@ extern "C"
 #include <SoftTimer.h>
 #include "base64.h"
 #include "okpqc.h"
+#include "okic2.h"
 
 /*************************************/
 //Firmware Memory Locations
@@ -204,6 +205,7 @@ extern "C"
 #define WEBAUTHN 1
 #define KEYBOARD_USB 3
 #define DISCARD 4
+#define RAW_I2C 5      // OnlyAgent appliance: I2C slave transport, see okic2.h
 /*************************************/
 //Crypto Key Definitions
 /*************************************/
@@ -215,6 +217,14 @@ extern "C"
 #define RESERVED_KEY_HMACSHA1_1 130
 #define RESERVED_KEY_HMACSHA1_2 129
 #define RESERVED_KEY_WEB_DERIVATION 128
+// OnlyAgent appliance derived X-Wing (full on-device, seed never leaves). The SLOT
+// selects the derivation label because buffer[6] is the packet length/0xFF flag on
+// the multi-packet path the 1120-byte X-Wing ct requires — it cannot carry a keytype.
+// Labels are firmware constants (see okcrypto_xwing_slot_label), so a compromised
+// host cannot ask the device to derive under a label of its choosing.
+// 117-127 are reserved-but-unnamed; host writes to 117-132 are already rejected.
+#define RESERVED_KEY_OA_FDE_KEK 127
+#define RESERVED_KEY_OA_FDE_TRANSIT 126
 #define KEYTYPE_NACL 1
 #define KEYTYPE_ED25519 1
 #define KEYTYPE_P256R1 2

@@ -141,59 +141,101 @@ hence `pk_M` and the recipient string — safe because that path was never relea
 marked UNTESTED, absent from `trustcrypto/libraries` master). No host change was needed: the
 browser/CLI receive the seed and never recompute it.
 
-### Dispatch
-In `okcrypto_getpubkey()`, beside the existing `RESERVED_KEY_WEB_DERIVATION`/`KEYTYPE_XWING`
-branch (which returns the split-custody `[pk_X|seed]`), add a **derived, no-seed-release** variant.
-Suggested wire: keytype byte with bit 7 set (`0x86`) selects "derived, full on-device":
-```c
-} else if (buffer[5] == RESERVED_KEY_WEB_DERIVATION &&
-           (buffer[6] & 0x7F) == KEYTYPE_XWING && (buffer[6] & 0x80)) {
-    okcrypto_xwing_derive_seed(buffer + 7);   // label32 at buffer+7
-    okcrypto_xwing_getpubkey(buffer);         // returns pk_M||pk_X (1216B)
-    memset(ecc_private_key, 0, 32);
-    return;
-}
-```
-And the matching branch in `okcrypto_decrypt()`, before the slot lookup:
-```c
-if (buffer[5] == RESERVED_KEY_WEB_DERIVATION &&
-    (buffer[6] & 0x7F) == KEYTYPE_XWING && (buffer[6] & 0x80)) {
-    okcrypto_xwing_derive_seed(buffer + 7);   // label32; ct(1120) already in large_buffer
-    okcrypto_xwing_decaps(buffer);            // full on-device decaps -> ss
-    memset(ecc_private_key, 0, 32);
-    return;
-}
-```
-`okcrypto_xwing_decaps()` reads the ct from `large_buffer` via the existing multi-packet
-reassembly, so the host just uses `send_large_message2()` — no transport change.
+### The slot is the discriminator (not a keytype byte)
 
-### Session retain + touch policy
-`okcrypto_xwing_decaps()` ends with `send_transport_response(ss, XWING_SS_SIZE, true, true)` — it
-returns `ss`. For transit setup `ss` must be RETAINED instead:
+The purpose — and therefore the label — is selected by the **slot** (`buffer[5]`), using two new
+reserved defines in `okcore.h`:
+
 ```c
-    if (okic2_session_target) {
+#define RESERVED_KEY_OA_FDE_KEK     127   // label "fde:onlyagent"
+#define RESERVED_KEY_OA_FDE_TRANSIT 126   // label "fde-transit:onlyagent"
+```
+
+Why not a keytype byte or a host-supplied label — three hard constraints:
+
+1. **`buffer[6]` is already taken.** On the multi-packet path `process_packets()` reads `buffer[6]`
+   as the chunk length / `0xFF` continuation flag. The 1120-byte X-Wing ct *must* be packetized, so
+   `buffer[6]` cannot also carry a keytype. (The existing split-custody branch gets away with
+   `buffer[6] & 0x0F` only because its input is a single 64-byte report — and its own comment
+   already flags that framing as unvalidated.)
+2. **`label32 || ct` does not fit.** `LARGE_BUFFER_SIZE == PACKET_BUFFER_SIZE == 1120`, which is
+   exactly `XWING_CT_SIZE`. Sending a label alongside the ct would need both buffers grown.
+3. **`buffer[5]` survives.** `process_packets()` stores the slot in `packet_buffer_details[1]` and
+   rejects packets whose slot changes mid-message, so the slot is reliable in both phases of the
+   CRYPTO_AUTH flow.
+
+Making the labels firmware constants is also a security gain: the host names a *purpose*, never
+label bytes, so a compromised host cannot steer derivation. `okcrypto_xwing_slot_label()` maps slot
+→ `SHA256(utf8(label))`; it must stay in sync with `okfde-client`'s `SLOT_FDE_KEK`/`SLOT_FDE_TRANSIT`.
+
+With the ct alone in `large_buffer`, `okcrypto_xwing_decaps()` is reused **verbatim**.
+
+### Dispatch
+`okcrypto_getpubkey()` — before the split-custody branch:
+```c
+} else if (buffer[5] == RESERVED_KEY_OA_FDE_KEK || buffer[5] == RESERVED_KEY_OA_FDE_TRANSIT) {
+    uint8_t label32[32];
+    if (okcrypto_xwing_slot_label(buffer[5], label32)) {
+        okcrypto_xwing_derive_seed(label32);
+        okcrypto_xwing_getpubkey(buffer);      // pk_M||pk_X (1216B); seed NOT disclosed
+        memset(ecc_private_key, 0, MAX_ECC_KEY_SIZE);
+        memset(label32, 0, sizeof(label32));
+    }
+}
+```
+`okcrypto_decrypt()` — first, before the slot lookup. Re-derives on **both** phases (the seed is
+not retained across the button press), which is safe because `buffer[5]` is preserved:
+```c
+if (buffer[5] == RESERVED_KEY_OA_FDE_KEK || buffer[5] == RESERVED_KEY_OA_FDE_TRANSIT) {
+    uint8_t label32[32];
+    if (okcrypto_xwing_slot_label(buffer[5], label32)) {
+        okcrypto_xwing_derive_seed(label32);
+        memset(label32, 0, sizeof(label32));
+        okcrypto_xwing_decaps(buffer);
+    }
+    return;
+}
+```
+
+### Transit retain + touch policy
+`okcrypto_xwing_decaps()` ended with `send_transport_response(ss, XWING_SS_SIZE, true, true)`.
+For the transit slot `ss` is RETAINED instead — unconditionally, so that slot can never emit a
+shared secret on any transport:
+```c
+    if (packet_buffer_details[1] == RESERVED_KEY_OA_FDE_TRANSIT) {
         okic2_session_set(ss);                 // transit_key = SHA256(ss)
         uint8_t ack[2] = {0x01, 0x00};
-        send_transport_response(ack, 2, false, false);   // plaintext ack
+        send_transport_response(ack, 2, false, false);   // plaintext ack, no secret
     } else {
         send_transport_response(ss, XWING_SS_SIZE, true, true);
     }
 ```
-`okcrypto_xwing_decaps()` also gates on `CRYPTO_AUTH` (button press). Keep that for the KEK
-decapsulation, but **skip it when `okic2_session_target`** — nothing leaves the device on that
-path, so a touch buys nothing:
+(Phase 2 reads the slot from `packet_buffer_details[1]`, not `buffer[5]`.)
+
+Touch: keep `CRYPTO_AUTH` for the KEK, skip it for transit setup — nothing leaves the device, so a
+touch buys nothing. This uses the same "no press required" idiom as the HMAC challenge-mode path
+(`okcore.cpp` ~7471: `CRYPTO_AUTH = 4; op(); CRYPTO_AUTH = 0;`):
 ```c
-    if (!CRYPTO_AUTH && !okic2_session_target) {
+    if (!CRYPTO_AUTH) {
         process_packets(buffer, 0, 0);
+        // done_process_packets() sets CRYPTO_AUTH=1 only once the LAST packet has
+        // landed, so this fires exactly once, fully staged.
+        if (buffer[5] == RESERVED_KEY_OA_FDE_TRANSIT && CRYPTO_AUTH == 1) {
+            CRYPTO_AUTH = 4;
+            okcrypto_xwing_decaps(buffer);
+            CRYPTO_AUTH = 0;
+            return;
+        }
         pending_operation = OKDECRYPT_ERR_USER_ACTION_PENDING;
     }
 ```
+Slot 126/127 are >116 and not >200, so `done_process_packets()` loads neither
+`derived_key_challenge_mode` nor `stored_key_challenge_mode` — CRYPTO_AUTH lands on 1, never 3.
 Net boot UX: PIN + one touch (for the KEK).
 
-### Why derived rather than a slot
-- No ECC slot consumed. Slots 101–116 are the user's; 117–132 are reserved
-  (`okcore.cpp` rejects writes to 117–132), so a slot-based FDE key would either squat on user
-  space or need a new reserved define.
+### Why derived rather than an ECC slot key
+- No user ECC slot consumed. 101–116 are the user's; 117–132 are reserved and host writes there are
+  already rejected, so 126/127 are safe to claim as *purpose selectors* (no key is stored in them).
 - Deterministic from `(web-derivation key, label)` — and the web-derivation key is already covered
   by OnlyKey backup/restore, so the FDE key survives device replacement with no extra provisioning.
 - The seed never leaves, unlike the split-custody `okcrypto_xwing_web_derive()` path used by the

@@ -2639,6 +2639,15 @@ void send_transport_response(uint8_t *data, int len, uint8_t encrypt, uint8_t st
 		#endif
 		wipedata(); //Wait 5 seconds for this to be retreived
 	}
+	else if (outputmode == RAW_I2C)
+	{ // OnlyAgent appliance: I2C slave transport. okic2 encrypts at the transport
+	  // layer whenever a single-use transit key is armed, so `encrypt` is ignored
+	  // here (as it is on the RAW_USB path). See okic2.h / INTEGRATION-i2c.md.
+		for (int i = 0; i < len; i += 64)
+		{
+			okic2_queue_response(data + i, (len - i >= 64) ? 64 : (len - i));
+		}
+	}
 	else if (outputmode == DISCARD)
 	{ // Discard, don't send anything
 	}

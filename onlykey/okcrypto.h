@@ -140,6 +140,9 @@ extern void okcrypto_mlkem_getpubkey (uint8_t *buffer);
 extern void okcrypto_xwing_keygen (uint8_t *buffer);
 extern void okcrypto_xwing_decaps (uint8_t *buffer);
 extern void okcrypto_xwing_getpubkey (uint8_t *buffer);
+// Derived X-Wing (no ECC slot, seed never leaves): puts a label-derived seed in
+// ecc_private_key so xwing_getpubkey/xwing_decaps work unchanged. See okcrypto.cpp.
+extern void okcrypto_xwing_derive_seed (uint8_t *label32);
 
 
 #ifdef __cplusplus
