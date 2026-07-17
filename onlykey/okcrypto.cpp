@@ -96,7 +96,13 @@
 //ML-KEM-768 (FIPS 203) support
 /*************************************/
 extern "C" {
-#include "mlkem_native/mlkem_native.h"
+// Flat include, not "mlkem_native/mlkem_native.h": the subdir form needs the
+// libraries ROOT on the include path, which Arduino never adds — it only adds
+// -I<libraries>/<lib> for libraries it detects from the SKETCH's includes. The
+// sketch therefore carries `#include <mlkem_native.h>`, which both puts
+// libraries/mlkem_native on the include path and gets mlkem_native.c compiled
+// (it is a monobuild: it #includes all of src/*.c).
+#include "mlkem_native.h"
 }
 
 // Access SHA3-256 and SHAKE256 from mlkem-native (already compiled in)
@@ -382,6 +388,7 @@ void okcrypto_decrypt (uint8_t *buffer){
 		}
 		return;
 	}
+#endif
 	if (buffer[5] == RESERVED_KEY_WEB_DERIVATION && (buffer[6] & 0x0F) == KEYTYPE_XWING) {
 		// Derived X-Wing decaps over HID (split custody). Input carries the
 		// 32-byte label tag then ct_X(32). NOTE: 32+32=64B exceeds one 57-byte

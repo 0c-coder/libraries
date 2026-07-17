@@ -26,7 +26,11 @@ extern "C" int PQCP_MLDSA_NATIVE_MLDSA65_signature(uint8_t *sig, size_t *siglen,
 
 /* ---- firmware RNG bridges required by mlkem_native / mldsa_native configs ----
  * RNG is the Arduino Crypto library global (RNG.h), as used elsewhere in the firmware. */
-extern "C" int onlykey_mlkem_randombytes(uint8_t *out, size_t outlen) { RNG.rand(out, (size_t)outlen); return 0; }
+/* onlykey_mlkem_randombytes() is NOT defined here: okcrypto.cpp already defines it
+ * (next to the ML-KEM/X-Wing code that needs it). Defining it in both files is a
+ * duplicate symbol and fails to link ("multiple definition of
+ * onlykey_mlkem_randombytes") — an artifact of merging feature/mlkem-768 and
+ * feature/pqc-pgp-slots, each of which added its own bridge. */
 extern "C" int onlykey_mldsa_randombytes(uint8_t *out, size_t outlen) { RNG.rand(out, (size_t)outlen); return 0; }
 
 /* ---- firmware globals/APIs (okcore.cpp / okcrypto.cpp) ---- */
