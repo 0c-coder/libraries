@@ -175,6 +175,17 @@ void okic2_poll(void)
     rx_complete = false;
     interrupts();
 
+    // Locked: never feed host data into the dispatch. The frame is CONSUMED and
+    // DROPPED (not left staged, which would pin the transport at status BUSY) and
+    // nothing is parsed. The status byte already reports LOCKED, which is all the
+    // host needs — okfde-client polls it until the PIN is entered. So the device
+    // does not receive data before unlock; it only ever answers "locked".
+    if (!unlocked) {
+        memset(report, 0, sizeof(report));
+        okic2_session_end();   // no transit key may outlive a lock
+        return;
+    }
+
     if (report[4] == OKIC2_CMD_SESSEND) {
         okic2_session_end();
         uint8_t ack[2] = {0x01, 0x00};
