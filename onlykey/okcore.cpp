@@ -2677,7 +2677,20 @@ void send_transport_response(uint8_t *data, int len, uint8_t encrypt, uint8_t st
 			#ifdef DEBUG_CTAP_VERBOSE
 			byteprint(resp_buffer, 64);
 			#endif
-			RawHID.send2(resp_buffer, 0);
+			// RawHID.send2(buf, 0) gives up almost instantly if the firmware's
+			// 4-packet TX queue (TX_PACKET_LIMIT, usb_rawhid.c) is still full,
+			// returning 0 without sending - and that return value was never
+			// checked here, so a full queue silently dropped this chunk
+			// entirely. A real per-attempt timeout lets it actually wait for
+			// queue space to free up (usb_rawhid_send2() already loops on
+			// that internally, it just wasn't given any time budget to);
+			// retrying on top of that covers the rare case where one 100ms
+			// window still isn't enough. Root cause of the intermittent
+			// truncated multi-packet responses (X-Wing pubkey, etc.) seen
+			// from the host side all session.
+			for (int tries = 0; tries < 5; tries++) {
+				if (RawHID.send2(resp_buffer, 100)) break;
+			}
 		}
 	}
 	else if (profilemode != NONENCRYPTEDPROFILE && outputmode == WEBAUTHN)
