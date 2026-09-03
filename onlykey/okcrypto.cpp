@@ -328,32 +328,46 @@ void okcrypto_decrypt (uint8_t *buffer){
 		// RESERVED_KEY_WEB_DERIVATION (128) is unique within OKDECRYPT's
 		// dispatch, so buffer[5] alone is enough to recognize every chunk of
 		// this request.
-		static uint8_t derive_buf[64];
-		static int derive_offset = 0;
-		if (buffer[6] == 0xFF) {
-			if (derive_offset + 57 <= 64) {
-				memcpy(derive_buf + derive_offset, buffer + 7, 57);
-				derive_offset += 57;
-			}
+		// User presence: this used to answer immediately, with no button
+		// gate at all over raw HID (the FIDO2 route in ok_extension.cpp has
+		// its own REQ_PRESS handling; this one had none). Use the same
+		// challenge machinery as every stored-slot decrypt: process_packets()
+		// accumulates the [label32 | ct_X32] chunks into packet_buffer, and
+		// done_process_packets() encrypts them into large_buffer and primes
+		// the challenge (CRYPTO_AUTH=1, LED fade). The button handler in
+		// OnlyKey.ino re-enters okcrypto_decrypt() with CRYPTO_AUTH==4 and
+		// recv_buffer[5]==RESERVED_KEY_WEB_DERIVATION once the user has
+		// confirmed (3-digit challenge, or any press in
+		// derived_key_challenge_mode 1).
+		if (!CRYPTO_AUTH) {
+			process_packets(buffer, 0, 0);
+			pending_operation = OKDECRYPT_ERR_USER_ACTION_PENDING;
+			return;
+		} else if (CRYPTO_AUTH != 4) {
+			return; // challenge in progress
+		}
+		okcore_aes_gcm_decrypt(large_buffer, packet_buffer_details[0], packet_buffer_details[1], profilekey, large_buffer_offset);
+		if (large_buffer_offset != 64) {
+			hidprint("Error derived X-Wing request wrong size");
+			memset(large_buffer, 0, LARGE_BUFFER_SIZE);
+			fadeoff(0);
 			return;
 		}
-		if (derive_offset + buffer[6] == 64) {
-			memcpy(derive_buf + derive_offset, buffer + 7, buffer[6]);
-		}
-		derive_offset = 0;
 		uint8_t out64[64];
-		okcrypto_xwing_web_derive(derive_buf, derive_buf + 32, out64);
+		okcrypto_xwing_web_derive(large_buffer, large_buffer + 32, out64);
+		pending_operation = CTAP2_ERR_DATA_READY;
+		outputmode = packet_buffer_details[2];
 		send_transport_response(out64, 64, false, false);
+		if (outputmode != WEBAUTHN) {
+			wipetasks();
+		}
 		memset(out64, 0, 64);
-		memset(derive_buf, 0, 64);
-		// The OKDECRYPT dispatcher (okcore.cpp) calls fadeon(128) before
-		// every decrypt; every other branch here ends with fadeoff(). This
-		// one returned without it, so isfade stayed set: the LED kept fading
-		// turquoise indefinitely and, because config-mode entry and the
-		// button handler both require !isfade, the key ignored every press
-		// until it was unplugged. Seen on hardware 2026-09-03 after each
-		// derived age decrypt.
-		fadeoff(0);
+		memset(large_buffer, 0, LARGE_BUFFER_SIZE);
+		// Release the LED/button state primed by the OKDECRYPT dispatcher's
+		// fadeon(128); without this isfade stayed set, the LED faded turquoise
+		// forever and every button press (config mode included) was ignored
+		// until the key was re-plugged. Seen on hardware 2026-09-03.
+		fadeoff(85);
 		return;
 	}
 	if (buffer[5] < 101) { //Slot 101-132 are for ECC, 1-4 are for RSA
