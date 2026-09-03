@@ -7561,7 +7561,12 @@ void done_process_packets()
 	stored_key_challenge_mode = 0;
 	CRYPTO_AUTH = 1;
 	fadeoffafter20(); //Wipe and fadeoff after 20 seconds
-	if (packet_buffer_details[1] > 200) { 
+	// Derived keys: the SSH/GPG derivation slots (>200) and the web/age
+	// derivation slot (RESERVED_KEY_WEB_DERIVATION, 128 - derived X-Wing
+	// decaps over raw HID) both follow the derived-key challenge mode.
+	// 128 was in neither range, so it always fell back to the 3-digit
+	// challenge regardless of the setting.
+	if (packet_buffer_details[1] > 200 || packet_buffer_details[1] == RESERVED_KEY_WEB_DERIVATION) { 
 		okeeprom_eeget_derived_key_challenge_mode(&derived_key_challenge_mode);
 	}
 	if (packet_buffer_details[1] < 5 || (packet_buffer_details[1] > 100 && packet_buffer_details[1] <= 116)) { 
