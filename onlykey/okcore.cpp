@@ -2052,24 +2052,6 @@ void set_slot(uint8_t *buffer)
 			hidprint("Error not in config mode");
 		}
 		break;
-	case 30:
-		// Web (FIDO2) derived-key user input mode: 0 = no press, host chooses per
-		// request; 1 = press required for every derive; 2 = challenge code required.
-		if (configmode == true || !initcheck)
-		{
-			if (buffer[7] > USER_INPUT_NONE) { hidprint("Error invalid user input mode"); break; }
-			#ifdef DEBUG
-			Serial.println();
-			Serial.println("Writing web_derive_mode to EEPROM...");
-			#endif
-			okeeprom_eeset_web_derive_mode(buffer + 7);
-			hidprint("Successfully set web derived key mode");
-		}
-		else
-		{
-			hidprint("Error not in config mode");
-		}
-		break;
 	case 26:
 
 		if (configmode == true || !initcheck)
@@ -6753,15 +6735,6 @@ void backup()
 		large_temp[large_buffer_offset] = 0xFF;   //delimiter
 		large_temp[large_buffer_offset + 1] = 0;  //slot 0
 		large_temp[large_buffer_offset + 2] = 21; //21 - derived challenge mode
-		large_temp[large_buffer_offset + 3] = temp[0];
-		large_buffer_offset = large_buffer_offset + 4;
-	}
-	okeeprom_eeget_web_derive_mode(ptr);
-	if (*ptr != 0)
-	{
-		large_temp[large_buffer_offset] = 0xFF;   //delimiter
-		large_temp[large_buffer_offset + 1] = 0;  //slot 0
-		large_temp[large_buffer_offset + 2] = 30; //30 - web derived key mode
 		large_temp[large_buffer_offset + 3] = temp[0];
 		large_buffer_offset = large_buffer_offset + 4;
 	}
