@@ -311,6 +311,7 @@ extern uint8_t user_input_mode;
 extern uint8_t pending_op_no_press;
 extern void okcore_run_pending_op();
 extern uint8_t okcore_user_input_mode_for_slot(uint8_t slot);
+extern uint8_t okcore_web_derive_mode();
 extern int large_buffer_offset;
 
 extern void okcore_flashset_2ndpinhashpublic (uint8_t *ptr);

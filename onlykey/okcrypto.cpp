@@ -245,7 +245,10 @@ void okcrypto_xwing_web_derive (uint8_t *label32, uint8_t *ct_x, uint8_t *out64)
 	const char rpid[] = "onlyagent.app";
 	memcpy(ctap_buffer + 4, rpid, sizeof(rpid) - 1);
 	ctap_buffer[4 + sizeof(rpid) - 1] = 0x02;
-	// additional_data = [0][label32]; flag 0 matches the web DERIVE (non REQ_PRESS)
+	// additional_data = [0][label32]. The web derived key is FIXED for a label -
+	// it does NOT depend on press. Press / challenge-code is only how the user
+	// AUTHORISES a derive (web_derive_mode), never which key comes out, so a file
+	// encrypted to a label always decrypts regardless of the auth setting.
 	uint8_t additional_data[33] = {0};
 	memcpy(additional_data + 1, label32, 32);
 	memset(ecc_public_key, 0, sizeof(ecc_public_key));

@@ -458,6 +458,8 @@ extern "C"
 #define EEpos_touchoffset (EEpos_yubicounterpart + EElen_yubicounterpart)
 #define EEpos_fwvermaj (EEpos_touchoffset + 1)
 #define EEpos_slottypespeed (EEpos_fwvermaj + EElen_slottypespeed)
+#define EElen_web_derive_mode 1
+#define EEpos_web_derive_mode (EEpos_slottypespeed + EElen_slottypespeed)
 
 extern int  okeeprom_eeget_ctap_authstate (uint8_t *ptr);
 extern void okeeprom_eeset_ctap_authstate(uint8_t *ptr);
@@ -479,6 +481,8 @@ extern void okeeprom_eeset_derived_key_challenge_mode(uint8_t *ptr);
 
 extern int  okeeprom_eeget_stored_key_challenge_mode (uint8_t *ptr);
 extern void okeeprom_eeset_stored_key_challenge_mode(uint8_t *ptr);
+extern int  okeeprom_eeget_web_derive_mode (uint8_t *ptr);
+extern void okeeprom_eeset_web_derive_mode(uint8_t *ptr);
 
 extern int  okeeprom_eeget_hmac_challengemode (uint8_t *ptr);
 extern void okeeprom_eeset_hmac_challengemode(uint8_t *ptr);

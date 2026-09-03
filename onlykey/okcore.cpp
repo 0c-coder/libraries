@@ -2052,6 +2052,27 @@ void set_slot(uint8_t *buffer)
 			hidprint("Error not in config mode");
 		}
 		break;
+	case 30:
+		// Web derived key user input mode (web app / OnlyAgent, over FIDO2 or raw
+		// HID slot 128): 0 = challenge code, 1 = button press, 2 = no press. Unlike
+		// 21/22, no-press is always allowed here - press-free per-site derivation
+		// is the feature - and it is the first-init default. The key itself never
+		// depends on this setting.
+		if (configmode == true || !initcheck)
+		{
+			if (buffer[7] > USER_INPUT_NONE) { hidprint("Error invalid user input mode"); break; }
+			#ifdef DEBUG
+			Serial.println();
+			Serial.println("Writing web_derive_mode to EEPROM...");
+			#endif
+			okeeprom_eeset_web_derive_mode(buffer + 7);
+			hidprint("Successfully set web derived key mode");
+		}
+		else
+		{
+			hidprint("Error not in config mode");
+		}
+		break;
 	case 26:
 
 		if (configmode == true || !initcheck)
@@ -6006,9 +6027,20 @@ bool wipebuffersafter5sec(Task *me)
 	return false;
 }
 
+// Web derived keys (browser over FIDO2, python age plugin over raw HID slot
+// 128) follow web_derive_mode. An unwritten EEPROM byte (0xFF) reads as the
+// default, no press. No-press is always honoured here - it is the feature.
+uint8_t okcore_web_derive_mode() {
+	uint8_t mode = USER_INPUT_NONE;
+	okeeprom_eeget_web_derive_mode(&mode);
+	if (mode > USER_INPUT_NONE) mode = USER_INPUT_NONE;
+	return mode;
+}
+
 uint8_t okcore_user_input_mode_for_slot(uint8_t slot) {
+	if (slot == RESERVED_KEY_WEB_DERIVATION) return okcore_web_derive_mode();
 	uint8_t mode = USER_INPUT_CHALLENGE;
-	if (slot > 200 || slot == RESERVED_KEY_WEB_DERIVATION) {
+	if (slot > 200) {
 		okeeprom_eeget_derived_key_challenge_mode(&mode);
 	} else {
 		okeeprom_eeget_stored_key_challenge_mode(&mode);
@@ -6735,6 +6767,15 @@ void backup()
 		large_temp[large_buffer_offset] = 0xFF;   //delimiter
 		large_temp[large_buffer_offset + 1] = 0;  //slot 0
 		large_temp[large_buffer_offset + 2] = 21; //21 - derived challenge mode
+		large_temp[large_buffer_offset + 3] = temp[0];
+		large_buffer_offset = large_buffer_offset + 4;
+	}
+	okeeprom_eeget_web_derive_mode(ptr);
+	if (*ptr != 0)
+	{
+		large_temp[large_buffer_offset] = 0xFF;   //delimiter
+		large_temp[large_buffer_offset + 1] = 0;  //slot 0
+		large_temp[large_buffer_offset + 2] = 30; //30 - web derived key mode
 		large_temp[large_buffer_offset + 3] = temp[0];
 		large_buffer_offset = large_buffer_offset + 4;
 	}

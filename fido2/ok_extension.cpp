@@ -126,6 +126,42 @@ extern uint8_t recv_buffer[64];
 extern uint8_t pending_operation;
 extern int packet_buffer_offset;
 extern uint8_t packet_buffer_details[5];
+
+// ---- Web derived key user input (web_derive_mode, OKSETSLOT 30) ----
+// The setting decides how the user authorises a shared-secret derive: 0 = the
+// 3-digit challenge code, 1 = button press, 2 = none (default). The key never
+// depends on it. A REQ_PRESS request variant can only RAISE the requirement to
+// a press (a page asking for presence gets it; a hostile page cannot lower the
+// setting). Challenge code = SHA-256 over the request bytes the device hashes -
+// the 32-byte label hash then the 32/64-byte ct_X / input public key - bytes
+// 0/15/31 mod 6 (mod 3 on a DUO) plus one; the web app computes and shows it.
+// Public-key derives are never gated.
+static int web_derive_gate(uint8_t opt1, const uint8_t *data, int len)
+{
+	extern uint8_t onlykeyhw;
+	uint8_t need = okcore_web_derive_mode();
+	if (need == USER_INPUT_NONE && (opt1 == DERIVE_PUBLIC_KEY_REQ_PRESS || opt1 == DERIVE_SHAREDSEC_REQ_PRESS)) need = USER_INPUT_PRESS;
+	if (need == USER_INPUT_NONE) return 0;
+	int but;
+	device_set_status(CTAPHID_STATUS_UPNEEDED);
+	if (need == USER_INPUT_PRESS) {
+		but = ctap_user_presence_test(CTAP2_UP_DELAY_MS);
+	} else {
+		uint8_t h[32];
+		SHA256_CTX c;
+		sha256_init(&c);
+		sha256_update(&c, (uint8_t *)data, len);
+		sha256_final(&c, h);
+		uint8_t m = (onlykeyhw == OK_HW_DUO) ? 3 : 6;
+		but = ctap_challenge_test(CTAP2_UP_DELAY_MS, (h[0] % m) + 1, (h[15] % m) + 1, (h[31] % m) + 1);
+		memset(h, 0, 32);
+	}
+	if (but == -2) { pending_operation = 0; return CTAP2_ERR_OPERATION_DENIED; }
+	if (but > 1) return CTAP2_ERR_PROCESSING;
+	if (but < 0) return CTAP2_ERR_KEEPALIVE_CANCEL;
+	if (but == 0) { pending_operation = 0; return CTAP2_ERR_ACTION_TIMEOUT; }
+	return 0;
+}
 uint8_t transit_key[32];
 
 // Duplicate-packet suppression high-water mark for inbound OKDECRYPT/OKSIGN
@@ -240,10 +276,12 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
 			if (opt1>=DERIVE_PUBLIC_KEY) {
 				if (opt3) opt3=2; // 1=encrypt everything, 2=encrypt everything except transit public so app can derive shared secret
 				uint8_t *input_pubkey = client_handle+43+32; // Use uncompressed ecc pubkeys, could use compressed in future
+				// The web derived key is FIXED for a label; it does not depend on
+				// press. REQ_PRESS now only affects AUTHORISATION (web_derive_mode),
+				// not which key is derived - so additional_data[0] stays 0 for both
+				// variants. (Both EC and X-Wing web derive are pre-release, so this
+				// breaking change to the key is fine.)
 				uint8_t additional_data[33] = {0};
-				if (opt1 == DERIVE_PUBLIC_KEY_REQ_PRESS || opt1 == DERIVE_SHAREDSEC_REQ_PRESS) {
-					additional_data[0] = 1; // Generate different key for REQ_PRESS than non REQ_PRESS
-				}
 				memcpy(additional_data+1, client_handle+43, 32); // 32 bytes of data to include in key derivation
 				opt2++;
 				memset(ecc_public_key, 0, sizeof(ecc_public_key));
@@ -271,8 +309,9 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
 				// surrounding CTAP2 request instead. Calling the shared
 				// function fixes that by construction and removes the
 				// duplicate-implementation drift risk entirely. This also
-				// means X-Wing derives the same key regardless of REQ_PRESS
-				// (okcrypto_xwing_web_derive has no such distinction, matching
+				// X-Wing (like the generic EC keytypes below) derives a FIXED key for
+				// a label regardless of REQ_PRESS - the press choice is authorisation
+				// only (web_derive_mode), matching
 				// the CLI path, which never had one either) - unlike the
 				// generic EC keytypes below, whose REQ_PRESS/non-REQ_PRESS
 				// separation this doesn't touch.
@@ -280,13 +319,11 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
 					uint8_t *xout = temp + 32 + sizeof(UNLOCKED) + 1;
 					uint8_t *label32 = client_handle + 43;
 					if (opt1 == DERIVE_SHAREDSEC || opt1 == DERIVE_SHAREDSEC_REQ_PRESS) {
-						if (opt1 == DERIVE_SHAREDSEC_REQ_PRESS) {
-							int but;
-							device_set_status(CTAPHID_STATUS_UPNEEDED);
-							but = ctap_user_presence_test(CTAP2_UP_DELAY_MS);
-							if (but > 1) return CTAP2_ERR_PROCESSING;
-							else if (but < 0) return CTAP2_ERR_KEEPALIVE_CANCEL;
-							else if (but == 0) { pending_operation = 0; return CTAP2_ERR_ACTION_TIMEOUT; }
+						{
+							// gate over [label32 | ct_X32] - the same 64 bytes the raw-HID
+							// derived decaps hashes, so both paths show the same code
+							int g = web_derive_gate(opt1, client_handle + 43, 64);
+							if (g) return g;
 						}
 						// ct_X = input pubkey from the age stanza
 						uint8_t *ct_X = client_handle + 43 + 32;
@@ -343,25 +380,10 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
 					}
 					else { 
 						// Generate Shared Secret
-						if (opt1==DERIVE_SHAREDSEC_REQ_PRESS) {
-							int but;
-							device_set_status(CTAPHID_STATUS_UPNEEDED);
-							but = ctap_user_presence_test(CTAP2_UP_DELAY_MS);
-							if ( but > 1 )
-							{
-								return CTAP2_ERR_PROCESSING;
-							}
-							else if (but < 0)
-							{
-								return CTAP2_ERR_KEEPALIVE_CANCEL;
-							}
-							else if (but == 0)
-							{
-								pending_operation=0;
-								return CTAP2_ERR_ACTION_TIMEOUT;
-							} else if (os == 'W') {
-								packet_buffer_details[3] = 'W';
-							}
+						{
+							int g = web_derive_gate(opt1, client_handle + 43, 32 + pubsize);
+							if (g) return g;
+							if (opt1==DERIVE_SHAREDSEC_REQ_PRESS && os == 'W') packet_buffer_details[3] = 'W';
 						}
 						// Use ecc_private_key and provided pubkey to generate shared secret
 						if (okcrypto_shared_secret (input_pubkey, temp+32+sizeof(UNLOCKED)+1+pubsize)) { // Generate derived key shared secret in temp
