@@ -346,6 +346,14 @@ void okcrypto_decrypt (uint8_t *buffer){
 		send_transport_response(out64, 64, false, false);
 		memset(out64, 0, 64);
 		memset(derive_buf, 0, 64);
+		// The OKDECRYPT dispatcher (okcore.cpp) calls fadeon(128) before
+		// every decrypt; every other branch here ends with fadeoff(). This
+		// one returned without it, so isfade stayed set: the LED kept fading
+		// turquoise indefinitely and, because config-mode entry and the
+		// button handler both require !isfade, the key ignored every press
+		// until it was unplugged. Seen on hardware 2026-09-03 after each
+		// derived age decrypt.
+		fadeoff(0);
 		return;
 	}
 	if (buffer[5] < 101) { //Slot 101-132 are for ECC, 1-4 are for RSA
