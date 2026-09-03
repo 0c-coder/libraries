@@ -2054,10 +2054,10 @@ void set_slot(uint8_t *buffer)
 		break;
 	case 30:
 		// Web derived key user input mode (web app / OnlyAgent, over FIDO2 or raw
-		// HID slot 128): 0 = challenge code, 1 = button press, 2 = no press. Unlike
-		// 21/22, no-press is always allowed here - press-free per-site derivation
-		// is the feature - and it is the first-init default. The key itself never
-		// depends on this setting.
+		// HID slot 128): 0 = challenge code, 1 = button press (default), 2 = no
+		// press. Unlike 21/22, no-press is always allowed here (press-free per-site
+		// derivation is an opt-in feature). The key itself never depends on this
+		// setting.
 		if (configmode == true || !initcheck)
 		{
 			if (buffer[7] > USER_INPUT_NONE) { hidprint("Error invalid user input mode"); break; }
@@ -6028,12 +6028,14 @@ bool wipebuffersafter5sec(Task *me)
 }
 
 // Web derived keys (browser over FIDO2, python age plugin over raw HID slot
-// 128) follow web_derive_mode. An unwritten EEPROM byte (0xFF) reads as the
-// default, no press. No-press is always honoured here - it is the feature.
+// 128) follow web_derive_mode: 0 challenge code, 1 button press (default),
+// 2 no press. An unwritten EEPROM byte (0xFF) reads as the default. No-press
+// is honoured here when set (unlike stored/derived keys) - press-free per-site
+// derivation is an opt-in feature, not the default.
 uint8_t okcore_web_derive_mode() {
-	uint8_t mode = USER_INPUT_NONE;
+	uint8_t mode = USER_INPUT_PRESS;
 	okeeprom_eeget_web_derive_mode(&mode);
-	if (mode > USER_INPUT_NONE) mode = USER_INPUT_NONE;
+	if (mode > USER_INPUT_NONE) mode = USER_INPUT_PRESS;
 	return mode;
 }
 

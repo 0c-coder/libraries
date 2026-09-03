@@ -129,7 +129,7 @@ extern uint8_t packet_buffer_details[5];
 
 // ---- Web derived key user input (web_derive_mode, OKSETSLOT 30) ----
 // The setting decides how the user authorises a shared-secret derive: 0 = the
-// 3-digit challenge code, 1 = button press, 2 = none (default). The key never
+// 3-digit challenge code, 1 = button press (default), 2 = none. The key never
 // depends on it. A REQ_PRESS request variant can only RAISE the requirement to
 // a press (a page asking for presence gets it; a hostile page cannot lower the
 // setting). Challenge code = SHA-256 over the request bytes the device hashes -
