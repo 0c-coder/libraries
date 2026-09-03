@@ -284,6 +284,8 @@ uint8_t Challenge_button3 = 0;
 uint8_t CRYPTO_AUTH = 0;
 uint8_t derived_key_challenge_mode = 0;
 uint8_t stored_key_challenge_mode = 0;
+uint8_t user_input_mode = USER_INPUT_CHALLENGE;
+uint8_t pending_op_no_press = 0;
 /*************************************/
 //RNG Assignments
 /*************************************/
@@ -2018,6 +2020,10 @@ void set_slot(uint8_t *buffer)
 			Serial.println(); //newline
 			Serial.println("Writing derived_key_challenge_mode to EEPROM...");
 			#endif
+			if (buffer[7] > USER_INPUT_NONE) { hidprint("Error invalid user input mode"); break; }
+			#ifndef OK_ALLOW_NO_PRESS
+			if (buffer[7] == USER_INPUT_NONE) { hidprint("Error unsupported user input mode"); break; }
+			#endif
 			okeeprom_eeset_derived_key_challenge_mode(buffer + 7);
 			hidprint("Successfully set derived key challenge mode");
 		}
@@ -2034,8 +2040,30 @@ void set_slot(uint8_t *buffer)
 			Serial.println(); //newline
 			Serial.println("Writing stored_key_challenge_mode to EEPROM...");
 			#endif
+			if (buffer[7] > USER_INPUT_NONE) { hidprint("Error invalid user input mode"); break; }
+			#ifndef OK_ALLOW_NO_PRESS
+			if (buffer[7] == USER_INPUT_NONE) { hidprint("Error unsupported user input mode"); break; }
+			#endif
 			okeeprom_eeset_stored_key_challenge_mode(buffer + 7);
 			hidprint("Successfully set stored key challenge mode");
+		}
+		else
+		{
+			hidprint("Error not in config mode");
+		}
+		break;
+	case 30:
+		// Web (FIDO2) derived-key user input mode: 0 = no press, host chooses per
+		// request; 1 = press required for every derive; 2 = challenge code required.
+		if (configmode == true || !initcheck)
+		{
+			if (buffer[7] > USER_INPUT_NONE) { hidprint("Error invalid user input mode"); break; }
+			#ifdef DEBUG
+			Serial.println();
+			Serial.println("Writing web_derive_mode to EEPROM...");
+			#endif
+			okeeprom_eeset_web_derive_mode(buffer + 7);
+			hidprint("Successfully set web derived key mode");
 		}
 		else
 		{
@@ -5323,7 +5351,12 @@ void ecc_priv_flash(uint8_t *buffer, bool wipe, bool quiet)
 			// own `if (!CRYPTO_AUTH)` check can never be satisfied - CRYPTO_AUTH
 			// is otherwise only ever primed by the decaps functions, for their
 			// own unrelated operations.
-			if (!CRYPTO_AUTH) {
+			// Keys can only be loaded in config mode, and the device cannot be
+			// used while in config mode (leaving it means a physical
+			// remove/reinsert), so config mode IS the presence proof - and the
+			// button challenge cannot be completed there anyway (the config-mode
+			// LED owns the indicator). Only prime the challenge on first use.
+			if (!CRYPTO_AUTH && !configmode) {
 				uint8_t primebuf[64];
 				memset(primebuf, 0, 64);
 				primebuf[4] = buffer[4];
@@ -5334,7 +5367,7 @@ void ecc_priv_flash(uint8_t *buffer, bool wipe, bool quiet)
 				process_packets(primebuf, 0, 0);
 				pending_operation = CTAP2_ERR_USER_ACTION_PENDING;
 				return;
-			} else if (CRYPTO_AUTH != 4) {
+			} else if (CRYPTO_AUTH != 4 && !configmode) {
 				return; // challenge in progress, ignore re-entrant triggers
 			}
 			// CRYPTO_AUTH==4: confirmed via the 3-button challenge, proceed.
@@ -5991,6 +6024,65 @@ bool wipebuffersafter5sec(Task *me)
 	return false;
 }
 
+uint8_t okcore_user_input_mode_for_slot(uint8_t slot) {
+	uint8_t mode = USER_INPUT_CHALLENGE;
+	if (slot > 200 || slot == RESERVED_KEY_WEB_DERIVATION) {
+		okeeprom_eeget_derived_key_challenge_mode(&mode);
+	} else {
+		okeeprom_eeget_stored_key_challenge_mode(&mode);
+	}
+	mode &= 0x03; // older firmware packed FIDO2 origin bits into this byte
+	#ifndef OK_ALLOW_NO_PRESS
+	if (mode == USER_INPUT_NONE) mode = USER_INPUT_CHALLENGE; // fail closed
+	#endif
+	if (mode > USER_INPUT_NONE) mode = USER_INPUT_CHALLENGE;
+	return mode;
+}
+
+// Run the operation that done_process_packets() staged (encrypted in
+// large_buffer, described by packet_buffer_details) once the user has
+// confirmed it - or immediately, for USER_INPUT_NONE. Called from the button
+// handler in OnlyKey.ino and from checkKey() for the no-press path; CRYPTO_AUTH
+// must already be 4.
+void okcore_run_pending_op() {
+	derived_key_challenge_mode = 0;
+	stored_key_challenge_mode = 0;
+	if (packet_buffer_details[0] == OKSIGN) {
+		recv_buffer[4] = packet_buffer_details[0];
+		recv_buffer[5] = packet_buffer_details[1];
+		okcrypto_sign(recv_buffer);
+	} else if (packet_buffer_details[0] == OKDECRYPT) {
+		recv_buffer[4] = packet_buffer_details[0];
+		recv_buffer[5] = packet_buffer_details[1];
+		okcrypto_decrypt(recv_buffer);
+	} else if (packet_buffer_details[0] == OKHMAC) {
+		okcrypto_hmacsha1();
+	} else if (packet_buffer_details[0] == OKWEBAUTHN) {
+		u2f_button = 1;
+		unsigned long u2fwait = millis() + 4000;
+		while (u2f_button && millis() < u2fwait) {
+			recvmsg(0);
+		}
+		u2f_button = 0;
+	} else if (packet_buffer_details[0] == OKSETPRIV) {
+		// PQC (X-Wing/ML-KEM) keygen confirmation: ecc_priv_flash() primed this
+		// via process_packets(), which encrypted the [keytype, 0xFF x8] trigger
+		// into large_buffer - decrypt it back, rebuild recv_buffer in the layout
+		// set_private()/ecc_priv_flash() expect, and re-run now that CRYPTO_AUTH==4.
+		okcore_aes_gcm_decrypt(large_buffer, packet_buffer_details[0], packet_buffer_details[1], profilekey, large_buffer_offset);
+		recv_buffer[4] = packet_buffer_details[0];
+		recv_buffer[5] = packet_buffer_details[1];
+		recv_buffer[6] = large_buffer[0];
+		memcpy(recv_buffer + 7, large_buffer + 1, large_buffer_offset - 1);
+		set_private(recv_buffer);
+	}
+	CRYPTO_AUTH = 0;
+	user_input_mode = USER_INPUT_CHALLENGE;
+	pending_op_no_press = 0;
+	packet_buffer_details[0] = 0;
+	fadeoff(0);
+}
+
 void wipetasks() {
 	packet_buffer_offset = 0;
 	memset(ctap_buffer, 0, CTAPHID_BUFFER_SIZE);
@@ -6024,6 +6116,8 @@ void wipetasks() {
 	Challenge_button3 = 0;
 	derived_key_challenge_mode = 0;
 	stored_key_challenge_mode = 0;
+	user_input_mode = USER_INPUT_CHALLENGE;
+	pending_op_no_press = 0;
 	pending_operation = 0;
 	if (isfade || CRYPTO_AUTH) {
 		fadeoff(1); //Fade Red, failed to complete within 5 seconds
@@ -6659,6 +6753,15 @@ void backup()
 		large_temp[large_buffer_offset] = 0xFF;   //delimiter
 		large_temp[large_buffer_offset + 1] = 0;  //slot 0
 		large_temp[large_buffer_offset + 2] = 21; //21 - derived challenge mode
+		large_temp[large_buffer_offset + 3] = temp[0];
+		large_buffer_offset = large_buffer_offset + 4;
+	}
+	okeeprom_eeget_web_derive_mode(ptr);
+	if (*ptr != 0)
+	{
+		large_temp[large_buffer_offset] = 0xFF;   //delimiter
+		large_temp[large_buffer_offset + 1] = 0;  //slot 0
+		large_temp[large_buffer_offset + 2] = 30; //30 - web derived key mode
 		large_temp[large_buffer_offset + 3] = temp[0];
 		large_buffer_offset = large_buffer_offset + 4;
 	}
@@ -7561,19 +7664,19 @@ void done_process_packets()
 	stored_key_challenge_mode = 0;
 	CRYPTO_AUTH = 1;
 	fadeoffafter20(); //Wipe and fadeoff after 20 seconds
-	// Derived keys: the SSH/GPG derivation slots (>200) and the web/age
-	// derivation slot (RESERVED_KEY_WEB_DERIVATION, 128 - derived X-Wing
-	// decaps over raw HID) both follow the derived-key challenge mode.
-	// 128 was in neither range, so it always fell back to the 3-digit
-	// challenge regardless of the setting.
-	if (packet_buffer_details[1] > 200 || packet_buffer_details[1] == RESERVED_KEY_WEB_DERIVATION) { 
-		okeeprom_eeget_derived_key_challenge_mode(&derived_key_challenge_mode);
-	}
-	if (packet_buffer_details[1] < 5 || (packet_buffer_details[1] > 100 && packet_buffer_details[1] <= 116)) { 
-		okeeprom_eeget_stored_key_challenge_mode(&stored_key_challenge_mode);
-	}
+	// One setting per key family, resolved by slot: derived keys (SSH/GPG
+	// derivation codes >200 and the web/age derivation slot 128) follow
+	// derived_key_challenge_mode, everything else (RSA 1-4, ECC 101-132)
+	// follows stored_key_challenge_mode. The two used to be OR-ed together,
+	// so press-only on either made both press-only.
+	user_input_mode = okcore_user_input_mode_for_slot(packet_buffer_details[1]);
 	#ifdef STD_VERSION
-	if ((is_bit_set(derived_key_challenge_mode, 0))  || stored_key_challenge_mode) {
+	if (user_input_mode == USER_INPUT_NONE) {
+		// Run the operation from the main task after this receive completes,
+		// exactly as the button handler would, with no user interaction.
+		CRYPTO_AUTH = 4;
+		pending_op_no_press = 1;
+	} else if (user_input_mode == USER_INPUT_PRESS) {
 		CRYPTO_AUTH = 3;
 	} else {
 		SHA256_CTX msg_hash;

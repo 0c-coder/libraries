@@ -110,12 +110,13 @@ int webcryptcheck (uint8_t * _appid, uint8_t * buffer) {
     appid_match1 = memcmp (stored_apprpid, rpid, 12);
 	appid_match2 = memcmp (stored_appid, _appid, 32);
 	int appid_match3 = memcmp (stored_appid_oa, _appid, 32); //OnlyAgent origin (onlyagent.app)
-    if ((appid_match1 == 0 || appid_match2 == 0 || appid_match3 == 0) && !(is_bit_set(derived_key_challenge_mode, 1))) {
+    // The trusted origins are hardcoded in production firmware; there is no
+    // runtime override any more (the old bit 1 / bit 2 flags in
+    // derived_key_challenge_mode are gone - that byte is a plain mode enum now).
+    if (appid_match1 == 0 || appid_match2 == 0 || appid_match3 == 0) {
         return 2;
-    } else if (buffer[0]==0xFF && buffer[1]==0xFF && buffer[2]==0xFF && buffer[3]==0xFF && buffer[4]==OKCONNECT && is_bit_set(derived_key_challenge_mode, 2)) {
-        return 1;
     }
-    else return 0;
+    return 0;
 }
 
 void store_FIDO_response (uint8_t *data, int len, uint8_t encrypt) {
@@ -394,6 +395,37 @@ int ctap_user_presence_test(uint32_t wait)
         return 0;
     }
 
+}
+
+// 3-digit challenge on the CTAP path: the user must press the three given
+// buttons in order within `wait` ms. Returns 1 = entered, 0 = timeout,
+// -2 = wrong button, 2 = presence disabled, other >1 = handle_packets() result
+// (same contract as ctap_user_presence_test so callers map errors the same way).
+int ctap_challenge_test(uint32_t wait, uint8_t b1, uint8_t b2, uint8_t b3)
+{
+    extern int button_selected;
+    extern uint8_t isfade;
+    uint8_t expected[3] = {b1, b2, b3};
+    int idx = 0;
+    int ret = 0;
+    uint8_t blink = 0;
+    uint32_t t1 = millis();
+    if (_up_disabled) return 2;
+    fadeon(171);
+    while (1) {
+        if (t1 + wait < millis()) { fadeoff(1); return 0; }
+        if (touch_sense_loop()) {
+            uint8_t pressed = (uint8_t)(button_selected - '0');
+            button_selected = 0;
+            if (pressed != expected[idx]) { fadeoff(1); u2f_button = 0; return -2; }
+            if (++idx == 3) { fadeoff(0); u2f_button = 0; return 1; }
+        }
+        ret = handle_packets();
+        if (ret) return ret;
+        if (blink == 0) setcolor(171);
+        if (blink == 128) setcolor(0);
+        blink++;
+    }
 }
 
 int handle_packets()

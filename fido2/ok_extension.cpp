@@ -126,6 +126,45 @@ extern uint8_t recv_buffer[64];
 extern uint8_t pending_operation;
 extern int packet_buffer_offset;
 extern uint8_t packet_buffer_details[5];
+
+// ---- Web-derive user input policy (OKSETSLOT 30, okeeprom web_derive_mode) ----
+// Same enum as the raw-HID settings: 0 = challenge code, 1 = press, 2 = none.
+// The host's REQ_PRESS variant still selects WHICH key is derived; the setting
+// can only raise the gate (a non-press request under mode 1 still derives the
+// non-press key, but waits for a button). In mode 0 the code is the same rule
+// the raw-HID path uses: SHA-256 over the request data (label, plus ct_X or the
+// input public key for a shared-secret derive), bytes 0/15/31 mod 6 plus one
+// (mod 3 on a DUO). The web app computes and displays it.
+static int web_derive_gate(uint8_t opt1, const uint8_t *data, int len)
+{
+	extern uint8_t onlykeyhw;
+	uint8_t mode = USER_INPUT_NONE;
+	okeeprom_eeget_web_derive_mode(&mode);
+	if (mode > USER_INPUT_NONE) mode = USER_INPUT_NONE; // unwritten EEPROM (0xFF) = default
+	uint8_t need = (opt1 == DERIVE_PUBLIC_KEY_REQ_PRESS || opt1 == DERIVE_SHAREDSEC_REQ_PRESS) ? USER_INPUT_PRESS : USER_INPUT_NONE;
+	if (mode == USER_INPUT_PRESS && need == USER_INPUT_NONE) need = USER_INPUT_PRESS;
+	if (mode == USER_INPUT_CHALLENGE) need = USER_INPUT_CHALLENGE;
+	if (need == USER_INPUT_NONE) return 0;
+	int but;
+	device_set_status(CTAPHID_STATUS_UPNEEDED);
+	if (need == USER_INPUT_PRESS) {
+		but = ctap_user_presence_test(CTAP2_UP_DELAY_MS);
+	} else {
+		uint8_t h[32];
+		SHA256_CTX c;
+		sha256_init(&c);
+		sha256_update(&c, (uint8_t *)data, len);
+		sha256_final(&c, h);
+		uint8_t m = (onlykeyhw == OK_HW_DUO) ? 3 : 6;
+		but = ctap_challenge_test(CTAP2_UP_DELAY_MS, (h[0] % m) + 1, (h[15] % m) + 1, (h[31] % m) + 1);
+		memset(h, 0, 32);
+	}
+	if (but == -2) { pending_operation = 0; return CTAP2_ERR_OPERATION_DENIED; }
+	if (but > 1) return CTAP2_ERR_PROCESSING;
+	if (but < 0) return CTAP2_ERR_KEEPALIVE_CANCEL;
+	if (but == 0) { pending_operation = 0; return CTAP2_ERR_ACTION_TIMEOUT; }
+	return 0;
+}
 uint8_t transit_key[32];
 
 // Duplicate-packet suppression high-water mark for inbound OKDECRYPT/OKSIGN
@@ -243,27 +282,6 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
 				uint8_t additional_data[33] = {0};
 				if (opt1 == DERIVE_PUBLIC_KEY_REQ_PRESS || opt1 == DERIVE_SHAREDSEC_REQ_PRESS) {
 					additional_data[0] = 1; // Generate different key for REQ_PRESS than non REQ_PRESS
-				} else {
-					// derived_key_challenge_mode is a RAM cache of an EEPROM
-					// byte, unconditionally zeroed by wipetasks() and by every
-					// done_process_packets() call (the OnlyKey raw-HID
-					// pipeline - PIN unlock, status, OKCONNECT, SSH/GPG - a
-					// completely separate dispatch path from this FIDO2/CTAP
-					// one), and only reloaded there for slot codes >200 (an
-					// SSH/GPG-specific convention, okcrypto.cpp:207/369/650)
-					// that this FIDO2 path never sends. So the RAM copy is
-					// essentially always stale by the time this check runs,
-					// regardless of what's actually persisted in EEPROM.
-					// Reload directly here instead of trusting the cache -
-					// okeeprom_eeget_derived_key_challenge_mode() is a plain
-					// single-byte eeprom_read_byte(), no side effects.
-					okeeprom_eeget_derived_key_challenge_mode(&derived_key_challenge_mode);
-					if (!(is_bit_set(derived_key_challenge_mode, 3))) {
-						//derived keys per site without touch not enabeled
-						ret = CTAP2_ERR_EXTENSION_NOT_SUPPORTED; //APPID doesn't match
-						wipedata();
-						return ret;
-					}
 				}
 				memcpy(additional_data+1, client_handle+43, 32); // 32 bytes of data to include in key derivation
 				opt2++;
@@ -301,18 +319,17 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
 					uint8_t *xout = temp + 32 + sizeof(UNLOCKED) + 1;
 					uint8_t *label32 = client_handle + 43;
 					if (opt1 == DERIVE_SHAREDSEC || opt1 == DERIVE_SHAREDSEC_REQ_PRESS) {
-						if (opt1 == DERIVE_SHAREDSEC_REQ_PRESS) {
-							int but;
-							device_set_status(CTAPHID_STATUS_UPNEEDED);
-							but = ctap_user_presence_test(CTAP2_UP_DELAY_MS);
-							if (but > 1) return CTAP2_ERR_PROCESSING;
-							else if (but < 0) return CTAP2_ERR_KEEPALIVE_CANCEL;
-							else if (but == 0) { pending_operation = 0; return CTAP2_ERR_ACTION_TIMEOUT; }
+						{
+							// gate over [label32 | ct_X32] - the same 64 bytes the raw-HID
+							// derived decaps hashes, so both paths show the same code
+							int g = web_derive_gate(opt1, client_handle + 43, 64);
+							if (g) return g;
 						}
 						// ct_X = input pubkey from the age stanza
 						uint8_t *ct_X = client_handle + 43 + 32;
 						okcrypto_xwing_web_derive(label32, ct_X, xout);
 					} else {
+						// public material only - never gated, same as the EC keytypes
 						okcrypto_xwing_web_derive(label32, NULL, xout);
 					}
 					send_transport_response(temp, 32 + sizeof(UNLOCKED) + 1 + 64, opt3, false);
@@ -363,25 +380,10 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
 					}
 					else { 
 						// Generate Shared Secret
-						if (opt1==DERIVE_SHAREDSEC_REQ_PRESS) {
-							int but;
-							device_set_status(CTAPHID_STATUS_UPNEEDED);
-							but = ctap_user_presence_test(CTAP2_UP_DELAY_MS);
-							if ( but > 1 )
-							{
-								return CTAP2_ERR_PROCESSING;
-							}
-							else if (but < 0)
-							{
-								return CTAP2_ERR_KEEPALIVE_CANCEL;
-							}
-							else if (but == 0)
-							{
-								pending_operation=0;
-								return CTAP2_ERR_ACTION_TIMEOUT;
-							} else if (os == 'W') {
-								packet_buffer_details[3] = 'W';
-							}
+						{
+							int g = web_derive_gate(opt1, client_handle + 43, 32 + pubsize);
+							if (g) return g;
+							if (opt1==DERIVE_SHAREDSEC_REQ_PRESS && os == 'W') packet_buffer_details[3] = 'W';
 						}
 						// Use ecc_private_key and provided pubkey to generate shared secret
 						if (okcrypto_shared_secret (input_pubkey, temp+32+sizeof(UNLOCKED)+1+pubsize)) { // Generate derived key shared secret in temp

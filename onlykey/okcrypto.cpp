@@ -1877,7 +1877,7 @@ void okcrypto_mlkem_keygen (uint8_t *buffer) {
 	Serial.println();
 	Serial.println("MLKEM KEYGEN MESSAGE RECEIVED");
 	#endif
-	if (!CRYPTO_AUTH) {
+	if (!CRYPTO_AUTH && !configmode) {
 		pending_operation=CTAP2_ERR_USER_ACTION_PENDING;
 		return;
 	}
@@ -2021,7 +2021,7 @@ void okcrypto_xwing_keygen (uint8_t *buffer) {
 	Serial.println();
 	Serial.println("XWING KEYGEN MESSAGE RECEIVED");
 	#endif
-	if (!CRYPTO_AUTH) {
+	if (!CRYPTO_AUTH && !configmode) {
 		pending_operation=CTAP2_ERR_USER_ACTION_PENDING;
 		return;
 	}

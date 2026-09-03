@@ -298,6 +298,19 @@ extern bool configmode;
 extern bool PDmode;
 extern int pin_set;
 extern int u2f_button;
+// User input modes. One enum for all three settings (OKSETSLOT 21 derived keys,
+// 22 stored keys, 30 web/FIDO2 derived keys): 0 = 3-digit challenge code,
+// 1 = any button press, 2 = none. For 21/22, 2 is only honoured in
+// OK_ALLOW_NO_PRESS builds (unattended agents); for 30 it is the default and
+// means the web app chooses per request via the REQ_PRESS variants.
+// user_input_mode is the mode resolved for the operation currently waiting.
+#define USER_INPUT_CHALLENGE 0
+#define USER_INPUT_PRESS 1
+#define USER_INPUT_NONE 2
+extern uint8_t user_input_mode;
+extern uint8_t pending_op_no_press;
+extern void okcore_run_pending_op();
+extern uint8_t okcore_user_input_mode_for_slot(uint8_t slot);
 extern int large_buffer_offset;
 
 extern void okcore_flashset_2ndpinhashpublic (uint8_t *ptr);
