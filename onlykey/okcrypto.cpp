@@ -232,9 +232,26 @@ void okcrypto_sign (uint8_t *buffer) {
 }
 
 // ---- Derived (label-based) X-Wing split custody over HID ----------------
-// UNTESTED — validate on hardware. Origin is pinned to "onlyagent.app" so the
-// derived key matches the web app (age derived recipients). sk_X (X25519) never
-// leaves the device; the host expands mlkem_seed and does the ML-KEM half.
+// Exercised on real hardware: TC-16/TC-17 over raw HID and TC-18/TC-19 for
+// browser<->CLI interop, which is also why ok_extension.cpp calls THIS function
+// rather than keeping its own copy (see the note at ok_extension.cpp:280).
+// (This comment previously read "UNTESTED - validate on hardware", which had
+// been false since the alpha pass and contradicted ok_extension.cpp's own
+// account of the same function.)
+//
+// KNOWN DEFECT - do not treat this path as post-quantum until it is fixed:
+// mlkem_seed below is derived as SHA256(sk_X || tag), i.e. the ML-KEM half is a
+// CHILD of the X25519 half. An adversary who recovers sk_X from the published
+// pk_X therefore obtains the ML-KEM seed, sk_M, and the whole X-Wing shared
+// secret - so the hybrid degrades to X25519-only security, against exactly the
+// adversary the ML-KEM half exists to stop. The stored-slot path is unaffected
+// (it uses the spec expansion, xwing_shake256(expanded, 96, seed, 32)).
+// Fix in progress: derive a 32-byte X-Wing seed with HKDF, then run that same
+// spec expansion here so both halves are siblings of one SHAKE-256 stream.
+//
+// Origin is pinned to "onlyagent.app" so the derived key matches the web app
+// (age derived recipients). sk_X (X25519) never leaves the device; the host
+// expands mlkem_seed and does the ML-KEM half.
 //   ct_x == NULL : out64 = [ pk_X(32) | mlkem_seed(32) ]   (recipient/getpubkey)
 //   ct_x != NULL : out64 = [ ss_X(32) | mlkem_seed(32) ]   (decaps)
 // label32 is the 32-byte derivation tag; the CLI and web app MUST use the SAME
@@ -1316,7 +1333,15 @@ void okcrypto_hkdf(const void *salt, const void *inputKey, void *outputKey, cons
 	SHA256 hash;
 	uint8_t PRK[hash.hashSize()];
 	void *s;
-	uint8_t tmp[32];
+	// 33, not 32: the salt this function is called with is the 33-byte
+	// additional_data ([flag][32-byte tag]), and the salt == NULL branch below
+	// zero-fills and then HMAC-keys 33 bytes from here. At 32 that wrote one
+	// byte past the end of this buffer and read one byte past it as key
+	// material. Unreachable today - okcrypto_derive_key(), the only caller,
+	// always passes a non-NULL 33-byte salt - but the trap was live for the
+	// next caller. Sized off the salt length rather than the hash length on
+	// purpose; they are not the same quantity.
+	uint8_t tmp[33];
 	int N = L / hash.hashSize();
 	int i = 0;
 	uint8_t rpid[255] ={0};
@@ -1345,7 +1370,7 @@ void okcrypto_hkdf(const void *salt, const void *inputKey, void *outputKey, cons
 
 	if (salt == NULL) {
 		s = tmp;
-		memset(s, 0, 33);
+		memset(s, 0, sizeof(tmp));
 	} else {
 		s = (void *) salt;
 	}
