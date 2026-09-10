@@ -269,53 +269,42 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
 				opt2++;
 				memset(ecc_public_key, 0, sizeof(ecc_public_key));
 
-				// ---- X-Wing (mlkem768x25519) split custody -------------------
-				// Wire keytype 5 -> opt2==KEYTYPE_XWING(6). Returns 64 bytes,
-				// encrypted under the transit key when opt3:
-				//   DERIVE_PUBLIC_KEY -> [ pk_X(32) | mlkem_seed(32) ]
-				//   DERIVE_SHAREDSEC  -> [ ss_X(32) | mlkem_seed(32) ]
-				// sk_X (X25519) never leaves the device; the browser expands
-				// mlkem_seed and does the ML-KEM half locally.
+				// ---- X-Wing (mlkem768x25519), derived -----------------------
+				// Wire keytype 5 -> opt2 == KEYTYPE_XWING(6) (opt2++ above).
 				//
-				// Calls the SAME okcrypto_xwing_web_derive() the raw-HID path
-				// uses (okcrypto.cpp's okcrypto_getpubkey/okcrypto_decrypt,
-				// already proven correct against the CLI - TC-16/TC-17) rather
-				// than re-deriving inline, after finding live (TC-18/TC-19,
-				// browser<->CLI interop) that an earlier inline copy here
-				// produced a DIFFERENT sk_X than the CLI for the same label:
-				// okcrypto_hkdf() folds whatever RPID string is staged at
-				// ctap_buffer+4 into the derivation, and the raw-HID path
-				// explicitly stages "onlyagent.app" there
-				// (okcrypto_xwing_web_derive itself) before deriving, but this
-				// FIDO2 dispatch path never did - it derived using whatever
-				// RPID happened to already be in ctap_buffer from the
-				// surrounding CTAP2 request instead. Calling the shared
-				// function fixes that by construction and removes the
-				// duplicate-implementation drift risk entirely. This also
-				// means X-Wing derives the same key regardless of REQ_PRESS
-				// (okcrypto_xwing_web_derive has no such distinction, matching
-				// the CLI path, which never had one either) - unlike the
-				// generic EC keytypes below, whose REQ_PRESS/non-REQ_PRESS
-				// separation this doesn't touch.
+				// DERIVE_PUBLIC_KEY returns the full public recipient
+				//   [ pk_M(1184) | pk_X(32) ] = XWING_PK_SIZE
+				// staged into large_resp_buffer and retrieved in
+				// MAX_LARGE_RESP_CHUNK pieces by send_stored_response() - the
+				// same chunked path that already carries a 3309-byte ML-DSA-65
+				// composite signature. It does NOT fit in temp[256], which is
+				// why the payload is built in large_resp_buffer directly.
+				//
+				// It used to return [ pk_X(32) | mlkem_seed(32) ] and let the
+				// host expand the seed. mlkem_seed is private key material
+				// (it yields sk_M), so that handed out a private key in answer
+				// to a request for a public one. ML-KEM has no short public
+				// key - the only 32-byte value reproducing pk_M also reproduces
+				// sk_M - so the public key itself has to be what is sent.
+				//
+				// DERIVE_SHAREDSEC is NO LONGER served here. Decapsulation now
+				// needs the whole 1120-byte X-Wing ciphertext on the device
+				// (ct_M included), which does not fit this single-shot
+				// client_handle path. The browser sends it as a chunked
+				// OKDECRYPT to slot RESERVED_KEY_WEB_DERIVATION carrying
+				// [ label32 | ct(1120) ], the same tunnel composite_decrypt
+				// already uses; okcrypto_decrypt() handles it there.
 				if (opt2 == KEYTYPE_XWING) {
-					uint8_t *xout = temp + 32 + sizeof(UNLOCKED) + 1;
 					uint8_t *label32 = client_handle + 43;
 					if (opt1 == DERIVE_SHAREDSEC || opt1 == DERIVE_SHAREDSEC_REQ_PRESS) {
-						if (opt1 == DERIVE_SHAREDSEC_REQ_PRESS) {
-							int but;
-							device_set_status(CTAPHID_STATUS_UPNEEDED);
-							but = ctap_user_presence_test(CTAP2_UP_DELAY_MS);
-							if (but > 1) return CTAP2_ERR_PROCESSING;
-							else if (but < 0) return CTAP2_ERR_KEEPALIVE_CANCEL;
-							else if (but == 0) { pending_operation = 0; return CTAP2_ERR_ACTION_TIMEOUT; }
-						}
-						// ct_X = input pubkey from the age stanza
-						uint8_t *ct_X = client_handle + 43 + 32;
-						okcrypto_xwing_web_derive(label32, ct_X, xout);
-					} else {
-						okcrypto_xwing_web_derive(label32, NULL, xout);
+						hidprint("Error use OKDECRYPT for derived X-Wing decapsulation");
+						ret = send_stored_response(output, opt3);
+						return ret;
 					}
-					send_transport_response(temp, 32 + sizeof(UNLOCKED) + 1 + 64, opt3, false);
+					const int hdr = 32 + sizeof(UNLOCKED) + 1;
+					memmove(large_resp_buffer, temp, hdr);   /* transit pubkey + status */
+					okcrypto_xwing_derive_getpubkey(label32, large_resp_buffer + hdr);
+					send_transport_response(large_resp_buffer, hdr + XWING_PK_SIZE, opt3, false);
 					ret = send_stored_response(output, opt3);
 					return ret;
 				}

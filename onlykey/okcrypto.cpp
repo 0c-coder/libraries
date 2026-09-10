@@ -231,56 +231,182 @@ void okcrypto_sign (uint8_t *buffer) {
 	}
 }
 
-// ---- Derived (label-based) X-Wing split custody over HID ----------------
-// Exercised on real hardware: TC-16/TC-17 over raw HID and TC-18/TC-19 for
-// browser<->CLI interop, which is also why ok_extension.cpp calls THIS function
-// rather than keeping its own copy (see the note at ok_extension.cpp:280).
-// (This comment previously read "UNTESTED - validate on hardware", which had
-// been false since the alpha pass and contradicted ok_extension.cpp's own
-// account of the same function.)
+// ---- Derived (label-based) X-Wing over HID and FIDO2 --------------------
 //
-// KNOWN DEFECT - do not treat this path as post-quantum until it is fixed:
-// mlkem_seed below is derived as SHA256(sk_X || tag), i.e. the ML-KEM half is a
-// CHILD of the X25519 half. An adversary who recovers sk_X from the published
-// pk_X therefore obtains the ML-KEM seed, sk_M, and the whole X-Wing shared
-// secret - so the hybrid degrades to X25519-only security, against exactly the
-// adversary the ML-KEM half exists to stop. The stored-slot path is unaffected
-// (it uses the spec expansion, xwing_shake256(expanded, 96, seed, 32)).
-// Fix in progress: derive a 32-byte X-Wing seed with HKDF, then run that same
-// spec expansion here so both halves are siblings of one SHAKE-256 stream.
+// Nothing is stored: the keypair is reproduced on demand from
+// (slot-128 web-derivation key, 32-byte label tag, origin). Origin is pinned to
+// "onlyagent.app" so the CLI and the web app derive the same key; both hash the
+// label the same way (SHA256(utf8(label))).
 //
-// Origin is pinned to "onlyagent.app" so the derived key matches the web app
-// (age derived recipients). sk_X (X25519) never leaves the device; the host
-// expands mlkem_seed and does the ML-KEM half.
-//   ct_x == NULL : out64 = [ pk_X(32) | mlkem_seed(32) ]   (recipient/getpubkey)
-//   ct_x != NULL : out64 = [ ss_X(32) | mlkem_seed(32) ]   (decaps)
-// label32 is the 32-byte derivation tag; the CLI and web app MUST use the SAME
-// 32 bytes for a given identity (the CLI uses SHA256(utf8(label))).
-void okcrypto_xwing_web_derive (uint8_t *label32, uint8_t *ct_x, uint8_t *out64) {
-	extern uint8_t ctap_buffer[CTAPHID_BUFFER_SIZE];
-	// Stage RPID where okcrypto_hkdf reads it: ctap_buffer+4 .. 0x02 terminator
-	const char rpid[] = "onlyagent.app";
-	memcpy(ctap_buffer + 4, rpid, sizeof(rpid) - 1);
-	ctap_buffer[4 + sizeof(rpid) - 1] = 0x02;
-	// additional_data = [0][label32]; flag 0 matches the web DERIVE (non REQ_PRESS)
-	uint8_t additional_data[33] = {0};
-	memcpy(additional_data + 1, label32, 32);
-	memset(ecc_public_key, 0, sizeof(ecc_public_key));
-	// sk_X -> ecc_private_key, pk_X -> ecc_public_key
-	okcrypto_derive_key(KEYTYPE_CURVE25519, additional_data, RESERVED_KEY_WEB_DERIVATION);
-	// mlkem_seed = SHA256( sk_X || tag ) : one-way, domain-separated (!= sk_X)
-	const char xwtag[] = "onlykey/xwing/mlkem768-seed/v1";
-	SHA256_CTX xc; sha256_init(&xc);
-	sha256_update(&xc, ecc_private_key, 32);
-	sha256_update(&xc, (const uint8_t*)xwtag, sizeof(xwtag) - 1);
-	sha256_final(&xc, out64 + 32);   // mlkem_seed in bytes 32..64 (before ss_X to keep sk_X)
-	if (ct_x) {
-		// ss_X = X25519(sk_X, ct_X); scalar is ecc_private_key set above
-		okcrypto_shared_secret(ct_x, out64);   // ss_X in bytes 0..32
-	} else {
-		memcpy(out64, ecc_public_key, 32);      // pk_X in bytes 0..32
+// Construction, in two clearly separated layers:
+//
+//   1. HKDF (RFC 5869, HMAC-SHA256) turns the device secret, the label and the
+//      origin into ONE 32-byte X-Wing seed. This is the only place HKDF
+//      appears and the only OnlyKey-specific step.
+//   2. That seed goes through the X-Wing spec's own key generation -
+//      xwing_shake256(expanded, 96, seed, 32), ML-KEM d||z = expanded[0:64],
+//      sk_X = expanded[64:96] - the SAME call and layout the stored-slot path
+//      uses (okcrypto_xwing_keygen / _decaps / _getpubkey). A derived keypair
+//      is therefore a real draft-connolly-cfrg-xwing-kem keypair.
+//
+// This replaces a construction in which mlkem_seed was SHA256(sk_X || tag) -
+// the ML-KEM half a CHILD of the X25519 half - so an adversary who recovered
+// sk_X from the published pk_X obtained the ML-KEM seed, sk_M and the whole
+// shared secret, and the hybrid degraded to X25519-only security against
+// exactly the adversary ML-KEM exists to stop. The halves are now sibling
+// slices of one SHAKE-256 stream over a secret seed: neither reveals the other,
+// in either direction.
+//
+// No private key material is returned to the host on either call now:
+//
+//   derive getpubkey : out = [ pk_M(1184) | pk_X(32) ] = XWING_PK_SIZE, public
+//   derive decaps    : out = [ ss(32) ]                = X-Wing shared secret
+//
+// The RPID staging is gone too: okcrypto_hkdf() reads its info string out of
+// ctap_buffer+4, so this code used to write "onlyagent.app" there before
+// deriving - and a FIDO2 path that did NOT stage it derived a different sk_X
+// than the CLI for the same label (ok_extension.cpp:280 documents that hunt).
+// okcrypto_hkdf_expand() takes info as an argument, so the shared mutable
+// buffer is out of the derivation entirely.
+
+/* HKDF-Expand, RFC 5869 section 2.3, with an explicit info string.
+ * okcrypto_hkdf() hardwires info to SHA256(RPID) read from ctap_buffer and is
+ * deliberately left untouched: the P-256 / Curve25519 / NACL web-derivation
+ * keytypes share it, and any change there moves keys that already exist. */
+void okcrypto_hkdf_expand (const uint8_t *prk, const uint8_t *info, size_t info_len,
+                           uint8_t *out, size_t L) {
+	SHA256 hash;
+	uint8_t T[32];
+	size_t done = 0, Tlen = 0;
+	uint8_t counter = 1;
+	while (done < L) {
+		hash.resetHMAC(prk, 32);
+		if (Tlen) hash.update(T, Tlen);       /* T(0) is empty, RFC 5869 */
+		hash.update(info, info_len);
+		hash.update(&counter, 1);
+		hash.finalizeHMAC(prk, 32, T, 32);
+		Tlen = 32;
+		size_t n = (L - done < 32) ? (L - done) : 32;
+		memcpy(out + done, T, n);
+		done += n;
+		counter++;
 	}
-	memset(additional_data, 0, sizeof(additional_data));
+	memset(T, 0, sizeof(T));
+}
+
+/* (slot-128 key, label, origin) -> one 32-byte X-Wing seed.
+ * 32 and not 64 on purpose: X-Wing's decapsulation key IS 32 bytes; the 64-byte
+ * quantity is ML-KEM's own d||z, which the spec expansion produces FROM it. */
+void okcrypto_xwing_derive_seed (const uint8_t *label32, uint8_t *seed_out) {
+	static const char RPID[] = "onlyagent.app";
+	static const char INFO[] = "onlykey/xwing/seed/v2";
+
+	uint8_t rpid_hash[32];
+	SHA256_CTX rc;
+	sha256_init(&rc);
+	sha256_update(&rc, (const uint8_t *)RPID, sizeof(RPID) - 1);
+	sha256_final(&rc, rpid_hash);
+
+	uint8_t salt[33] = {0};                        /* [flag 0][label32] */
+	memcpy(salt + 1, label32, 32);
+
+	okcore_flashget_ECC(RESERVED_KEY_WEB_DERIVATION);   /* IKM -> ecc_private_key */
+
+	SHA256 h;                                      /* HKDF-Extract, RFC 5869 2.2 */
+	uint8_t prk[32];
+	h.resetHMAC(salt, sizeof(salt));
+	h.update(ecc_private_key, 32);
+	h.finalizeHMAC(salt, sizeof(salt), prk, 32);
+
+	uint8_t info[32 + sizeof(INFO) - 1];
+	memcpy(info, rpid_hash, 32);                   /* origin binding */
+	memcpy(info + 32, INFO, sizeof(INFO) - 1);
+	okcrypto_hkdf_expand(prk, info, sizeof(info), seed_out, 32);
+
+	#ifdef DEBUG
+	Serial.println();
+	Serial.println("X-Wing PRK");
+	byteprint(prk, 32);
+	Serial.println("X-Wing derived seed");
+	byteprint(seed_out, 32);
+	#endif
+
+	memset(prk, 0, sizeof(prk));
+	memset(salt, 0, sizeof(salt));
+	memset(info, 0, sizeof(info));
+	memset(ecc_private_key, 0, sizeof(ecc_private_key));
+}
+
+/* Derived recipient. out must be XWING_PK_SIZE (1216) bytes.
+ * Same expansion and layout as okcrypto_xwing_getpubkey().
+ *
+ * UNRESOLVED - MUST be settled before this ships. Both derive entry points use
+ * ctap_buffer as ML-KEM scratch (sk_M 2400 + pk_M 1184 = 3584 B) and wipe it,
+ * copying okcrypto_xwing_getpubkey()/_decaps(). That is safe for the stored
+ * path, which is only ever reached from okcore.cpp's raw-HID dispatch. It is
+ * NOT obviously safe here: the derived path is ALSO reached from inside
+ * ok_extension.cpp, where ctap_buffer holds the in-flight CTAP request. The
+ * label survives (client_handle is a local 256-byte copy, ok_extension.cpp:161)
+ * but anything the extension still needs from ctap_buffer after this call is
+ * clobbered - and the old code only ever wrote 14 bytes there (the RPID
+ * staging), so this is a much larger blast radius than anything that path has
+ * survived before. Either confirm on HARDWARE that nothing downstream reads
+ * ctap_buffer after the extension calls this, or give the derived path its own
+ * scratch (the tail of ctap_buffer above the largest possible CTAP request, or
+ * a dedicated 3584-byte buffer if the RAM budget allows). Do not assume the
+ * emulator settles it. */
+void okcrypto_xwing_derive_getpubkey (const uint8_t *label32, uint8_t *out) {
+	extern uint8_t ctap_buffer[CTAPHID_BUFFER_SIZE];
+	uint8_t seed[32];
+	uint8_t expanded[96];
+
+	okcrypto_xwing_derive_seed(label32, seed);
+	xwing_shake256(expanded, 96, seed, XWING_SEED_SIZE);
+
+	uint8_t *sk_M = ctap_buffer;
+	uint8_t *pk_M = ctap_buffer + MLKEM_SK_SIZE;
+	crypto_kem_keypair_derand(pk_M, sk_M, expanded);
+
+	memcpy(out, pk_M, MLKEM_PK_SIZE);
+	crypto_scalarmult_base(out + MLKEM_PK_SIZE, expanded + 64);   /* pk_X */
+
+	memset(seed, 0, sizeof(seed));
+	memset(expanded, 0, sizeof(expanded));
+	memset(ctap_buffer, 0, MLKEM_SK_SIZE + MLKEM_PK_SIZE);
+}
+
+/* Derived decapsulation. ct is XWING_CT_SIZE (1120) = ct_M(1088) || ct_X(32);
+ * out is the 32-byte X-Wing shared secret. Mirrors okcrypto_xwing_decaps()'s
+ * body. ct_M now never leaves the host-to-device direction and the seed never
+ * leaves the device at all. Returns 0 on success. */
+int okcrypto_xwing_derive_decaps (const uint8_t *label32, const uint8_t *ct, uint8_t *out) {
+	extern uint8_t ctap_buffer[CTAPHID_BUFFER_SIZE];
+	uint8_t seed[32];
+	uint8_t expanded[96];
+	uint8_t ss_M[32], ss_X[32], pk_X[32];
+	uint8_t *sk_M = ctap_buffer;
+	uint8_t *pk_M = ctap_buffer + MLKEM_SK_SIZE;
+	int rc = -1;
+
+	okcrypto_xwing_derive_seed(label32, seed);
+	xwing_shake256(expanded, 96, seed, XWING_SEED_SIZE);
+
+	if (crypto_kem_keypair_derand(pk_M, sk_M, expanded) == 0) {
+		crypto_scalarmult_base(pk_X, expanded + 64);
+		if (crypto_kem_dec(ss_M, ct, sk_M) == 0) {
+			crypto_scalarmult(ss_X, expanded + 64, ct + MLKEM_CT_SIZE);  /* ct_X */
+			xwing_combiner(out, ss_M, ss_X, ct + MLKEM_CT_SIZE, pk_X);
+			rc = 0;
+		}
+	}
+
+	memset(seed, 0, sizeof(seed));
+	memset(expanded, 0, sizeof(expanded));
+	memset(ss_M, 0, sizeof(ss_M));
+	memset(ss_X, 0, sizeof(ss_X));
+	memset(pk_X, 0, sizeof(pk_X));
+	memset(ctap_buffer, 0, MLKEM_SK_SIZE + MLKEM_PK_SIZE);
+	return rc;
 }
 
 void okcrypto_getpubkey (uint8_t *buffer) {
@@ -300,12 +426,21 @@ void okcrypto_getpubkey (uint8_t *buffer) {
 	okcrypto_derive_key(buffer[6], buffer+7, NULL);
 	send_transport_response(ecc_public_key, 64, false, false);
 	} else if (buffer[5] == RESERVED_KEY_WEB_DERIVATION && (buffer[6] & 0x0F) == KEYTYPE_XWING) {
-		// Derived X-Wing recipient over HID: buffer[7..39] = 32-byte label tag.
-		// Returns [ pk_X(32) | mlkem_seed(32) ]. See okcrypto_xwing_web_derive.
-		uint8_t out64[64];
-		okcrypto_xwing_web_derive(buffer + 7, NULL, out64);
-		send_transport_response(out64, 64, false, false);
-		memset(out64, 0, 64);
+		// Derived X-Wing recipient: buffer[7..39] = 32-byte label tag.
+		// Returns the full public recipient [ pk_M(1184) | pk_X(32) ] - the same
+		// XWING_PK_SIZE payload okcrypto_xwing_getpubkey() returns for a stored
+		// slot. It used to return [ pk_X(32) | mlkem_seed(32) ]: 32 bytes of
+		// PRIVATE key material handed out in answer to a request for a PUBLIC
+		// key. ML-KEM has no short public key, and the only 32-byte value that
+		// reproduces pk_M also reproduces sk_M, so there was no encoding fix -
+		// the public key itself has to be the thing that is sent.
+		//
+		// 1216 bytes fits both transports: raw HID chunks at 64
+		// (send_transport_response), and WebAuthn stages into large_resp_buffer
+		// (3328) for chunked retrieval by send_stored_response() - the path
+		// already carrying a 3309-byte ML-DSA-65 signature.
+		okcrypto_xwing_derive_getpubkey(buffer + 7, large_resp_buffer);
+		send_transport_response(large_resp_buffer, XWING_PK_SIZE, true, true);
 	}
 }
 
@@ -345,24 +480,65 @@ void okcrypto_decrypt (uint8_t *buffer){
 		// RESERVED_KEY_WEB_DERIVATION (128) is unique within OKDECRYPT's
 		// dispatch, so buffer[5] alone is enough to recognize every chunk of
 		// this request.
-		static uint8_t derive_buf[64];
+		//
+		// WIRE CHANGE (rev 3): the payload is now
+		//     [ label32(32) | ct(1120) ] = 32 + XWING_CT_SIZE = 1152 bytes
+		// where ct = ct_M(1088) || ct_X(32) - the WHOLE X-Wing ciphertext - and
+		// the reply is the 32-byte X-Wing shared secret. Previously the host
+		// sent label32 || ct_X (64 B) and got back ss_X || mlkem_seed, then
+		// finished the ML-KEM half itself from the seed. ct_M never reached the
+		// device and the seed always reached the host; this reverses both, so
+		// the derived path custodies its whole key exactly as the stored path
+		// does.
+		//
+		// Reassembly keeps the label in its own 32 bytes and streams the
+		// ciphertext into large_buffer (LARGE_BUFFER_SIZE == XWING_CT_SIZE ==
+		// 1120, an exact fit), so no buffer constant changes and the added RAM
+		// cost is 32 bytes.
+		static uint8_t derive_label[32];
 		static int derive_offset = 0;
-		if (buffer[6] == 0xFF) {
-			if (derive_offset + 57 <= 64) {
-				memcpy(derive_buf + derive_offset, buffer + 7, 57);
-				derive_offset += 57;
-			}
+		const int derive_total = 32 + XWING_CT_SIZE;
+		int n = (buffer[6] == 0xFF) ? 57 : buffer[6];
+
+		if (n < 0 || derive_offset + n > derive_total) {
+			// Overlong or desynchronised: drop the whole request rather than
+			// decapsulate against a half-filled buffer. Silent truncation here
+			// is exactly what TC-17 looked like from the host side.
+			derive_offset = 0;
+			memset(derive_label, 0, sizeof(derive_label));
+			memset(large_buffer, 0, LARGE_BUFFER_SIZE);
+			hidprint("Error derived decaps payload size");
+			fadeoff(0);
 			return;
 		}
-		if (derive_offset + buffer[6] == 64) {
-			memcpy(derive_buf + derive_offset, buffer + 7, buffer[6]);
+		for (int i = 0; i < n; i++) {
+			int pos = derive_offset + i;
+			if (pos < 32) derive_label[pos] = buffer[7 + i];
+			else          large_buffer[pos - 32] = buffer[7 + i];
+		}
+		derive_offset += n;
+		if (buffer[6] == 0xFF) return;            /* more chunks coming */
+
+		if (derive_offset != derive_total) {
+			derive_offset = 0;
+			memset(derive_label, 0, sizeof(derive_label));
+			memset(large_buffer, 0, LARGE_BUFFER_SIZE);
+			hidprint("Error derived decaps payload size");
+			fadeoff(0);
+			return;
 		}
 		derive_offset = 0;
-		uint8_t out64[64];
-		okcrypto_xwing_web_derive(derive_buf, derive_buf + 32, out64);
-		send_transport_response(out64, 64, false, false);
-		memset(out64, 0, 64);
-		memset(derive_buf, 0, 64);
+
+		uint8_t ss[XWING_SS_SIZE];
+		if (okcrypto_xwing_derive_decaps(derive_label, large_buffer, ss) != 0) {
+			hidprint("Error X-Wing derived decaps failed");
+			fadeoff(0);
+		} else {
+			send_transport_response(ss, XWING_SS_SIZE, true, true);
+		}
+		memset(ss, 0, sizeof(ss));
+		memset(derive_label, 0, sizeof(derive_label));
+		memset(large_buffer, 0, LARGE_BUFFER_SIZE);
 		return;
 	}
 	if (buffer[5] < 101) { //Slot 101-132 are for ECC, 1-4 are for RSA

@@ -140,7 +140,15 @@ extern void okcrypto_mlkem_getpubkey (uint8_t *buffer);
 extern void okcrypto_xwing_keygen (uint8_t *buffer);
 extern void okcrypto_xwing_decaps (uint8_t *buffer);
 extern void okcrypto_xwing_getpubkey (uint8_t *buffer);
-extern void okcrypto_xwing_web_derive (uint8_t *label32, uint8_t *ct_x, uint8_t *out64);
+/* Derived (label-based) X-Wing. See the block comment in okcrypto.cpp.
+ * HKDF (RFC 5869) produces a 32-byte X-Wing seed; the spec's own
+ * xwing_shake256() expansion then produces the keypair, exactly as the
+ * stored-slot path does. No private key material is returned to the host. */
+extern void okcrypto_hkdf_expand (const uint8_t *prk, const uint8_t *info, size_t info_len,
+                                  uint8_t *out, size_t L);
+extern void okcrypto_xwing_derive_seed (const uint8_t *label32, uint8_t *seed_out);
+extern void okcrypto_xwing_derive_getpubkey (const uint8_t *label32, uint8_t *out);  /* XWING_PK_SIZE */
+extern int  okcrypto_xwing_derive_decaps (const uint8_t *label32, const uint8_t *ct, uint8_t *out);
 
 
 #ifdef __cplusplus
