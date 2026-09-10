@@ -247,28 +247,36 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
 				uint8_t additional_data[33] = {0};
 				if (opt1 == DERIVE_PUBLIC_KEY_REQ_PRESS || opt1 == DERIVE_SHAREDSEC_REQ_PRESS) {
 					additional_data[0] = 1; // Generate different key for REQ_PRESS than non REQ_PRESS
-				} else {
-					// derived_key_challenge_mode is a RAM cache of an EEPROM
-					// byte, unconditionally zeroed by wipetasks() and by every
-					// done_process_packets() call (the OnlyKey raw-HID
-					// pipeline - PIN unlock, status, OKCONNECT, SSH/GPG - a
-					// completely separate dispatch path from this FIDO2/CTAP
-					// one), and only reloaded there for slot codes >200 (an
-					// SSH/GPG-specific convention, okcrypto.cpp:207/369/650)
-					// that this FIDO2 path never sends. So the RAM copy is
-					// essentially always stale by the time this check runs,
-					// regardless of what's actually persisted in EEPROM.
-					// Reload directly here instead of trusting the cache -
-					// okeeprom_eeget_derived_key_challenge_mode() is a plain
-					// single-byte eeprom_read_byte(), no side effects.
-					okeeprom_eeget_derived_key_challenge_mode(&derived_key_challenge_mode);
-					if (!(is_bit_set(derived_key_challenge_mode, 3))) {
-						//derived keys per site without touch not enabeled
-						ret = CTAP2_ERR_EXTENSION_NOT_SUPPORTED; //APPID doesn't match
-						wipedata();
-						return ret;
-					}
 				}
+				// The touch-free opt-in (derived_key_challenge_mode bit 3) is
+				// GONE. It used to gate the non-REQ_PRESS opcodes: without it
+				// they were refused outright with
+				// CTAP2_ERR_EXTENSION_NOT_SUPPORTED. Two things were wrong with
+				// that.
+				//
+				// It did not do what its name said. "REQ_PRESS" on a PUBLIC KEY
+				// derivation never asked for a press - it only selected a
+				// different key - so a caller could always get a touch-free
+				// public-key derivation by sending opcode 3, bit 3 or no bit 3.
+				// The only real presence test was on DERIVE_SHAREDSEC_REQ_PRESS.
+				//
+				// And it made the shipped web app depend on a non-default
+				// setting: password-generator.js passes press_required=false for
+				// BOTH calls and vault.js passes false for the public-key step,
+				// so on a factory-default key (bit 3 clear) those features were
+				// refused outright rather than prompting for a tap.
+				//
+				// Presence is now decided by WHAT is being asked for, not by
+				// which opcode the caller picked or what the user configured:
+				//
+				//   public key   - no touch. It is public data, and the caller
+				//                  cannot turn that into a secret.
+				//   shared secret - ALWAYS a touch, both opcodes, no opt-out.
+				//                  This is a decryption capability.
+				//
+				// That makes touch-free decapsulation unreachable by any
+				// setting, and incidentally fixes the password generator and the
+				// vault on default devices.
 				memcpy(additional_data+1, client_handle+43, 32); // 32 bytes of data to include in key derivation
 				opt2++;
 				memset(ecc_public_key, 0, sizeof(ecc_public_key));
@@ -355,8 +363,9 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
 						return ret;
 					}
 					else { 
-						// Generate Shared Secret
-						if (opt1==DERIVE_SHAREDSEC_REQ_PRESS) {
+						// Generate Shared Secret. Both opcodes require a
+						// touch now - see the note above; there is no opt-out.
+						{
 							int but;
 							device_set_status(CTAPHID_STATUS_UPNEEDED);
 							but = ctap_user_presence_test(CTAP2_UP_DELAY_MS);

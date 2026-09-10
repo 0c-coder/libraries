@@ -93,6 +93,18 @@ int webcryptcheck (uint8_t * _appid, uint8_t * buffer) {
     extern uint8_t ctap_buffer[CTAPHID_BUFFER_SIZE];
     extern uint8_t derived_key_challenge_mode;
     memcpy(rpid, ctap_buffer+4, 12); 
+    // Read the mode byte from EEPROM rather than trusting the RAM copy. That
+    // copy is unconditionally zeroed by wipetasks() and by every
+    // done_process_packets() call (the raw-HID pipeline: PIN unlock, status,
+    // OKCONNECT, SSH/GPG - a different dispatch path from this one) and is only
+    // reloaded there for slot codes > 200, which this FIDO2 path never sends. So
+    // it is essentially always stale here, and every bit tested below would read
+    // as 0 whatever the user actually configured - silently ignoring both the
+    // kill switch (bit 1) and the stored-key opt-in (bit 4).
+    // okeeprom_eeget_derived_key_challenge_mode() is a plain single-byte
+    // eeprom_read_byte() with no side effects. ok_extension.cpp used to do this
+    // reload for the same reason, in code this change removed.
+    okeeprom_eeget_derived_key_challenge_mode(&derived_key_challenge_mode);
     #ifdef DEBUG
 	Serial.println("Ctap buffer:");
     byteprint(ctap_buffer, 12);
@@ -127,9 +139,13 @@ int webcryptcheck (uint8_t * _appid, uint8_t * buffer) {
         //
         // Default (mode byte 0) is therefore: derive yes, PGP no.
         return is_bit_set(derived_key_challenge_mode, 4) ? 2 : 1;
-    } else if (buffer[0]==0xFF && buffer[1]==0xFF && buffer[2]==0xFF && buffer[3]==0xFF && buffer[4]==OKCONNECT && is_bit_set(derived_key_challenge_mode, 2)) {
-        return 1;
     }
+    // The bit 2 escape hatch is GONE. It let an origin that matches NONE of the
+    // three hardcoded appids above through at level 1 as long as the message was
+    // an OKCONNECT. The allowed origins are compiled into this function on
+    // purpose; a user-settable bypass of that list is not a setting anyone
+    // needs, and it is the one setting whose misuse hands an arbitrary web page
+    // a derivation oracle.
     else return 0;
 }
 
