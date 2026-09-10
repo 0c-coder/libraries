@@ -90,8 +90,20 @@
 // Functions for use with derived key (RESERVED_KEY_WEB_DERIVATION)
 #define DERIVE_PUBLIC_KEY 1
 #define DERIVE_SHAREDSEC 2
-#define DERIVE_PUBLIC_KEY_REQ_PRESS 3
-#define DERIVE_SHAREDSEC_REQ_PRESS 4
+// 3 and 4 were DERIVE_PUBLIC_KEY_REQ_PRESS / DERIVE_SHAREDSEC_REQ_PRESS.
+// Removed, and the numbers are left burned rather than reused: an old client
+// still sending them must fail loudly, not be silently reinterpreted.
+//
+// They stopped meaning what their names said. Presence is now decided by what
+// is asked for (public key: never a touch; shared secret: always one), so the
+// only thing the suffix still selected was a SECOND KEY DOMAIN, via
+// additional_data[0] = 1 in the HKDF salt - two different keys per label,
+// picked by an opcode whose name was about touches. Nothing wants that: it
+// doubles the key space for no stated purpose and it is a trap for anyone
+// reading the callers, as vault.js proves - it fetched its public key in one
+// domain and did its ECDH in the other, believing it was only choosing whether
+// a touch was required.
+#define DERIVE_OPCODE_MAX DERIVE_SHAREDSEC
 // Option to encrypt response for end-to-end data in-transit encryption
 #define NO_ENCRYPT_RESP 0
 #define ENCRYPT_RESP 1
@@ -242,12 +254,22 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
 			// required making this useful for encrypted/private web pages that may
 			// be decrypted and viewed only when OnlyKey is connected and unlocked.
 			if (opt1>=DERIVE_PUBLIC_KEY) {
+				if (opt1 > DERIVE_OPCODE_MAX) {
+					// Was 3 or 4 (the removed REQ_PRESS pair), or garbage.
+					// Refuse rather than fall through: without this check an
+					// opt1 of 4 would miss every `opt1==DERIVE_SHAREDSEC` test
+					// below and be served as a PUBLIC KEY request, answering a
+					// shared-secret call with a public key and no error.
+					ret = CTAP2_ERR_EXTENSION_NOT_SUPPORTED;
+					wipedata();
+					return ret;
+				}
 				if (opt3) opt3=2; // 1=encrypt everything, 2=encrypt everything except transit public so app can derive shared secret
 				uint8_t *input_pubkey = client_handle+43+32; // Use uncompressed ecc pubkeys, could use compressed in future
+				// additional_data[0] is now always 0. It used to be 1 for the
+				// REQ_PRESS opcodes, which made them a second key domain; see
+				// the note by the opcode defines. One label, one key.
 				uint8_t additional_data[33] = {0};
-				if (opt1 == DERIVE_PUBLIC_KEY_REQ_PRESS || opt1 == DERIVE_SHAREDSEC_REQ_PRESS) {
-					additional_data[0] = 1; // Generate different key for REQ_PRESS than non REQ_PRESS
-				}
 				// The touch-free opt-in (derived_key_challenge_mode bit 3) is
 				// GONE. It used to gate the non-REQ_PRESS opcodes: without it
 				// they were refused outright with
@@ -258,7 +280,7 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
 				// derivation never asked for a press - it only selected a
 				// different key - so a caller could always get a touch-free
 				// public-key derivation by sending opcode 3, bit 3 or no bit 3.
-				// The only real presence test was on DERIVE_SHAREDSEC_REQ_PRESS.
+				// The only real presence test was on the shared-secret variant.
 				//
 				// And it made the shipped web app depend on a non-default
 				// setting: password-generator.js passes press_required=false for
@@ -308,7 +330,7 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
 				// already uses; okcrypto_decrypt() handles it there.
 				if (opt2 == KEYTYPE_XWING) {
 					uint8_t *label32 = client_handle + 43;
-					if (opt1 == DERIVE_SHAREDSEC || opt1 == DERIVE_SHAREDSEC_REQ_PRESS) {
+					if (opt1 == DERIVE_SHAREDSEC) {
 						hidprint("Error use OKDECRYPT for derived X-Wing decapsulation");
 						ret = send_stored_response(output, opt3);
 						return ret;
@@ -351,7 +373,7 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
 				byteprint(ecc_private_key, sizeof(ecc_private_key));
 				#endif
 
-				if (opt1==DERIVE_SHAREDSEC || opt1==DERIVE_SHAREDSEC_REQ_PRESS) { // Return DERIVE_PUBLIC_KEY and DERIVE_SHAREDSEC
+				if (opt1==DERIVE_SHAREDSEC) { // Return DERIVE_PUBLIC_KEY and DERIVE_SHAREDSEC
 					#ifdef DEBUG
 					Serial.println("Input Pubkey");
 					byteprint(input_pubkey, pubsize);
