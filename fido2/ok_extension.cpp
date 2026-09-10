@@ -177,7 +177,11 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
     byteprint(client_handle, handle_len);
 	#endif
 
-    if (webcryptcheck(_appid, client_handle)) {
+    // 0 = refuse, 1 = derived keys only, 2 = also stored-slot OKDECRYPT/OKSIGN
+    // (PGP). Evaluated once: it reads an EEPROM byte and the RPID out of
+    // ctap_buffer, and calling it twice invited the two answers to disagree.
+    const int wc_level = webcryptcheck(_appid, client_handle);
+    if (wc_level) {
       	outputmode=DISCARD; // Discard output 
 		if (cmd == OKCONNECT && !CRYPTO_AUTH) {
 			large_buffer_offset = 0;
@@ -394,7 +398,7 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
 			} else {
 				send_transport_response (temp, 32+sizeof(UNLOCKED)+1, opt3, false); //Encrypt if opt3 and send right away
 			}
-		} else if (webcryptcheck(_appid, client_handle)>1) {  // Protected mode, only allow crp.to and localhost
+		} else if (wc_level) {  // Protected mode, only allow crp.to and localhost
 			//Todo add localhost support
 			okcrypto_aes_crypto_box (client_handle, handle_len, true);
 			#ifdef DEBUG
@@ -418,6 +422,27 @@ int16_t bridge_to_onlykey(uint8_t * _appid, uint8_t * keyh, int handle_len, uint
 			}
 			// Break the FIDO message into packets
 			else if (!CRYPTO_AUTH) {
+				// opt1 is the SLOT for these commands. A derived-key request
+				// (RESERVED_KEY_WEB_DERIVATION) is allowed at level 1 - it is
+				// the derived X-Wing decapsulation path, which is chunked and
+				// so cannot use the single-shot OKCONNECT route. Anything
+				// naming a real slot is a stored-key operation (PGP and
+				// friends) and needs level 2, i.e. the user opting in with
+				// mode bit 4. Without this check, disabling PGP over FIDO2
+				// would also disable derived decapsulation, since both arrive
+				// as OKDECRYPT.
+				//
+				// OKPING is deliberately NOT gated: it is how a large response
+				// is retrieved in MAX_LARGE_RESP_CHUNK pieces, and the derived
+				// recipient is 1216 bytes, so level 1 needs it.
+				if (wc_level < 2 && opt1 != RESERVED_KEY_WEB_DERIVATION) {
+					#ifdef DEBUG
+					Serial.println("Stored-key operations over FIDO2 are disabled");
+					#endif
+					hidprint("Error stored key use over FIDO2 not enabled");
+					ret = send_stored_response(output, opt3);
+					return ret;
+				}
 				int i=0;
 				if (!last_request_opt3) last_request_opt3 = opt3; // first packet
 				else if (opt3 <= last_request_opt3) return 0; // duplicate packet, thanks to win 10 1903 sending all FIDO2 messages twice

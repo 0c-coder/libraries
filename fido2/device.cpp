@@ -111,7 +111,22 @@ int webcryptcheck (uint8_t * _appid, uint8_t * buffer) {
 	appid_match2 = memcmp (stored_appid, _appid, 32);
 	int appid_match3 = memcmp (stored_appid_oa, _appid, 32); //OnlyAgent origin (onlyagent.app)
     if ((appid_match1 == 0 || appid_match2 == 0 || appid_match3 == 0) && !(is_bit_set(derived_key_challenge_mode, 1))) {
-        return 2;
+        // A trusted origin now gets DERIVED-KEY access only (return 1) unless the
+        // user has explicitly opted in to stored-key operations over FIDO2 with
+        // bit 4. Level 2 is what unlocks the OKDECRYPT/OKSIGN tunnel in
+        // ok_extension.cpp, i.e. PGP and any other operation against a REAL
+        // slot, with the slot number chosen by the web page.
+        //
+        // This used to return 2 unconditionally, so every trusted origin could
+        // sign and decrypt with any slot on an unlocked key, and a user who
+        // wanted derived keys in the browser but NOT their PGP keys had no way
+        // to say so - the only opt-outs were bit 1 (kills the extension
+        // outright, derive included) and bit 2 (a widening, not a narrowing).
+        // Derived keys are label-scoped and reproducible; a stored PGP key is
+        // neither, so they do not belong behind the same switch.
+        //
+        // Default (mode byte 0) is therefore: derive yes, PGP no.
+        return is_bit_set(derived_key_challenge_mode, 4) ? 2 : 1;
     } else if (buffer[0]==0xFF && buffer[1]==0xFF && buffer[2]==0xFF && buffer[3]==0xFF && buffer[4]==OKCONNECT && is_bit_set(derived_key_challenge_mode, 2)) {
         return 1;
     }
