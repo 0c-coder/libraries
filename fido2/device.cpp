@@ -93,6 +93,18 @@ int webcryptcheck (uint8_t * _appid, uint8_t * buffer) {
     extern uint8_t ctap_buffer[CTAPHID_BUFFER_SIZE];
     extern uint8_t derived_key_challenge_mode;
     memcpy(rpid, ctap_buffer+4, 12); 
+    // Read the mode byte from EEPROM rather than trusting the RAM copy. That
+    // copy is unconditionally zeroed by wipetasks() and by every
+    // done_process_packets() call (the raw-HID pipeline: PIN unlock, status,
+    // OKCONNECT, SSH/GPG - a different dispatch path from this one) and is only
+    // reloaded there for slot codes > 200, which this FIDO2 path never sends. So
+    // it is essentially always stale here, and every bit tested below would read
+    // as 0 whatever the user actually configured - silently ignoring both the
+    // kill switch (bit 1) and the stored-key opt-in (bit 4).
+    // okeeprom_eeget_derived_key_challenge_mode() is a plain single-byte
+    // eeprom_read_byte() with no side effects. ok_extension.cpp used to do this
+    // reload for the same reason, in code this change removed.
+    okeeprom_eeget_derived_key_challenge_mode(&derived_key_challenge_mode);
     #ifdef DEBUG
 	Serial.println("Ctap buffer:");
     byteprint(ctap_buffer, 12);
@@ -111,10 +123,29 @@ int webcryptcheck (uint8_t * _appid, uint8_t * buffer) {
 	appid_match2 = memcmp (stored_appid, _appid, 32);
 	int appid_match3 = memcmp (stored_appid_oa, _appid, 32); //OnlyAgent origin (onlyagent.app)
     if ((appid_match1 == 0 || appid_match2 == 0 || appid_match3 == 0) && !(is_bit_set(derived_key_challenge_mode, 1))) {
-        return 2;
-    } else if (buffer[0]==0xFF && buffer[1]==0xFF && buffer[2]==0xFF && buffer[3]==0xFF && buffer[4]==OKCONNECT && is_bit_set(derived_key_challenge_mode, 2)) {
-        return 1;
+        // A trusted origin now gets DERIVED-KEY access only (return 1) unless the
+        // user has explicitly opted in to stored-key operations over FIDO2 with
+        // bit 4. Level 2 is what unlocks the OKDECRYPT/OKSIGN tunnel in
+        // ok_extension.cpp, i.e. PGP and any other operation against a REAL
+        // slot, with the slot number chosen by the web page.
+        //
+        // This used to return 2 unconditionally, so every trusted origin could
+        // sign and decrypt with any slot on an unlocked key, and a user who
+        // wanted derived keys in the browser but NOT their PGP keys had no way
+        // to say so - the only opt-outs were bit 1 (kills the extension
+        // outright, derive included) and bit 2 (a widening, not a narrowing).
+        // Derived keys are label-scoped and reproducible; a stored PGP key is
+        // neither, so they do not belong behind the same switch.
+        //
+        // Default (mode byte 0) is therefore: derive yes, PGP no.
+        return is_bit_set(derived_key_challenge_mode, 4) ? 2 : 1;
     }
+    // The bit 2 escape hatch is GONE. It let an origin that matches NONE of the
+    // three hardcoded appids above through at level 1 as long as the message was
+    // an OKCONNECT. The allowed origins are compiled into this function on
+    // purpose; a user-settable bypass of that list is not a setting anyone
+    // needs, and it is the one setting whose misuse hands an arbitrary web page
+    // a derivation oracle.
     else return 0;
 }
 
